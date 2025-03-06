@@ -102,9 +102,14 @@ class BikePathEnv(gym.Env):
             # Add vertex with attributes
             g.add_vertex(name=str(node))
             
-            # Add node attributes
+            # Add node attributes - ensure they're valid for igraph
             for k, v in attrs.items():
-                g.vs[i][k] = v
+                if isinstance(k, str):  # Only string attribute names are supported
+                    try:
+                        g.vs[i][k] = v
+                    except TypeError:
+                        # If the value type is not supported, convert to string
+                        g.vs[i][k] = str(v)
         
         # Add edges with attributes
         for u, v, key, attrs in nx_graph.edges(data=True, keys=True):
@@ -115,9 +120,22 @@ class BikePathEnv(gym.Env):
             # Add edge
             edge_id = g.add_edge(u_idx, v_idx)
             
-            # Add edge attributes
+            # Add edge attributes - ensure they're valid for igraph
             for k, v in attrs.items():
-                g.es[edge_id][k] = v
+                if isinstance(k, str):  # Only string attribute names are supported
+                    try:
+                        # Handle common types that might cause issues
+                        if isinstance(v, list) and len(v) > 0:
+                            # Convert lists to strings to avoid type issues
+                            g.es[edge_id][k] = str(v)
+                        elif v is not None:
+                            g.es[edge_id][k] = v
+                    except TypeError:
+                        print(f"Warning: Could not set edge attribute {k}={v} (type: {type(v)}), converting to string")
+                        try:
+                            g.es[edge_id][k] = str(v)
+                        except:
+                            pass  # Skip if all else fails
             
             # Add the key attribute from MultiGraph
             g.es[edge_id]['key'] = key
@@ -173,11 +191,20 @@ class BikePathEnv(gym.Env):
         lengths = []
         for u_idx, v_idx in node_pairs:
             try:
+                # Make sure all edges have valid length values before calculating paths
+                valid_weights = True
+                for e in G.es:
+                    if 'length' not in e.attributes() or not isinstance(e['length'], (int, float)) or e['length'] <= 0:
+                        e['length'] = 1.0
+                
                 # igraph's shortest_paths returns a matrix, we need [0][0] for first pair
                 path_length = G.shortest_paths(source=u_idx, target=v_idx, weights='length')[0][0]
-                if path_length > 0:
+                if path_length > 0 and path_length != float('inf'):
                     lengths.append(path_length)
             except Exception as e:
+                # Print helpful debug information for the first few errors
+                if len(lengths) < 5:
+                    print(f"Error calculating path length between {u_idx} and {v_idx}: {e}")
                 continue
         return lengths
                
@@ -432,9 +459,22 @@ class BikePathEnv(gym.Env):
             # Add the edge
             edge_id = self.graph.add_edge(u, v)
             
-            # Add attributes to the edge
+            # Add attributes to the edge with proper type handling
             for k, v in edge_data.items():
-                self.graph.es[edge_id][k] = v
+                if isinstance(k, str):  # Only string attribute names are supported
+                    try:
+                        # Handle common types that might cause issues
+                        if isinstance(v, list) and len(v) > 0:
+                            # Convert lists to strings to avoid type issues
+                            self.graph.es[edge_id][k] = str(v)
+                        elif v is not None:
+                            self.graph.es[edge_id][k] = v
+                    except TypeError:
+                        print(f"Warning: Could not set edge attribute {k}={v} (type: {type(v)}), converting to string")
+                        try:
+                            self.graph.es[edge_id][k] = str(v)
+                        except:
+                            pass  # Skip if all else fails
                 
             # Ensure length attribute exists
             if 'length' not in edge_data or edge_data['length'] <= 0:
