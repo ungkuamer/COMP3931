@@ -109,36 +109,46 @@ class BikePathEnv(gym.Env):
                         g.vs[i][k] = v
                     except TypeError:
                         # If the value type is not supported, convert to string
-                        g.vs[i][k] = str(v)
+                        try:
+                            g.vs[i][k] = str(v)
+                        except:
+                            pass
         
         # Add edges with attributes
+        edge_count = 0
         for u, v, key, attrs in nx_graph.edges(data=True, keys=True):
-            # Get corresponding vertex indices
-            u_idx = self.node_map[u]
-            v_idx = self.node_map[v]
-            
-            # Add edge
-            edge_id = g.add_edge(u_idx, v_idx)
-            
-            # Add edge attributes - ensure they're valid for igraph
-            for k, v in attrs.items():
-                if isinstance(k, str):  # Only string attribute names are supported
-                    try:
-                        # Handle common types that might cause issues
-                        if isinstance(v, list) and len(v) > 0:
-                            # Convert lists to strings to avoid type issues
-                            g.es[edge_id][k] = str(v)
-                        elif v is not None:
-                            g.es[edge_id][k] = v
-                    except TypeError:
-                        print(f"Warning: Could not set edge attribute {k}={v} (type: {type(v)}), converting to string")
+            try:
+                # Get corresponding vertex indices
+                u_idx = self.node_map[u]
+                v_idx = self.node_map[v]
+                
+                # Add edge
+                edge_id = g.add_edge(u_idx, v_idx)
+                edge_count += 1
+                
+                # Add edge attributes - ensure they're valid for igraph
+                for k, v in attrs.items():
+                    if isinstance(k, str):  # Only string attribute names are supported
                         try:
-                            g.es[edge_id][k] = str(v)
-                        except:
-                            pass  # Skip if all else fails
-            
-            # Add the key attribute from MultiGraph
-            g.es[edge_id]['key'] = key
+                            # Handle common types that might cause issues
+                            if isinstance(v, list) and len(v) > 0:
+                                # Convert lists to strings to avoid type issues
+                                g.es[edge_id][k] = str(v)
+                            elif v is not None:
+                                g.es[edge_id][k] = v
+                        except TypeError as e:
+                            # Skip with a warning instead of failing
+                            pass
+                
+                # Store the key as a string attribute to avoid type issues
+                g.es[edge_id]["key_attr"] = str(key)
+                
+            except Exception as e:
+                print(f"Error adding edge {u} -> {v}: {e}")
+                continue
+                
+        print(f"Added {edge_count} edges to igraph")
+        return g
         
         return g
 
@@ -231,8 +241,20 @@ class BikePathEnv(gym.Env):
                 target_name = self.walk_graph.vs[e.target]['name']
                 
                 if (source_name, target_name) not in bike_edges and (target_name, source_name) not in bike_edges:
-                    # Get edge attributes
-                    data = e.attributes()
+            data = {}
+            # Safely get edge attributes
+            try:
+                data = e.attributes()
+            except Exception as e_attr:
+                print(f"Error getting edge attributes: {e_attr}")
+                # Create minimal attributes if getting all fails
+                data = {}
+                for attr_name in ['length', 'highway']:
+                    try:
+                        if attr_name in e.attribute_names():
+                            data[attr_name] = e[attr_name]
+                    except:
+                        pass
                     
                     # Validate road type
                     road_type = data.get('highway', '')
@@ -377,11 +399,23 @@ class BikePathEnv(gym.Env):
     def _get_state(self):
         """Get current state with improved metrics and validation."""
         try:
-            # Calculate connectivity metrics
-            connectivity, path_efficiency = self._calculate_connectivity()
+            # Set default values in case calculation fails
+            connectivity = 0.0
+            path_efficiency = 0.0
+            pop_served = 0.0
             
-            # Calculate population served
-            pop_served = self._calculate_population_served()
+            # Safely calculate metrics, catching errors at each step
+            try:
+                # Calculate connectivity metrics
+                connectivity, path_efficiency = self._calculate_connectivity()
+            except Exception as e:
+                print(f"Error calculating connectivity: {e}")
+            
+            try:
+                # Calculate population served
+                pop_served = self._calculate_population_served()
+            except Exception as e:
+                print(f"Error calculating population served: {e}")
             
             # Calculate normalized budget
             norm_budget = self.budget / self.initial_budget
@@ -406,6 +440,7 @@ class BikePathEnv(gym.Env):
             
         except Exception as e:
             print(f"Error calculating state: {e}")
+            # Return zeros if anything fails
             return np.zeros(4, dtype=np.float32)
     
     def step(self, action):
@@ -442,8 +477,13 @@ class BikePathEnv(gym.Env):
         self.budget -= cost
         
         # Add edge to graph
-        # Check if edge already exists
-        edge_id = self.graph.get_eid(u, v, directed=False, error=False)
+        # Add better error handling for edge existence check
+        try:
+            edge_id = self.graph.get_eid(u, v, directed=False, error=False)
+        except Exception as e:
+            print(f"Error checking if edge exists: {e}")
+            edge_id = -1  # Assume edge doesn't exist
+            
         if edge_id == -1:  # Edge doesn't exist
             # Ensure nodes have proper attributes from walk graph
             for node_idx, attr_src in [(u, self.walk_graph.vs[u]), (v, self.walk_graph.vs[v])]:
@@ -657,8 +697,8 @@ class BikePathEnv(gym.Env):
         for e in ig_graph.es:
             source_name = ig_graph.vs[e.source]['name']
             target_name = ig_graph.vs[e.target]['name']
-            edge_attrs = {k: e[k] for k in e.attributes() if k != 'key'}
-            key = e.get('key', 0)
+            edge_attrs = {k: e[k] for k in e.attributes() if k != 'key_attr'}
+            key = int(e.get('key_attr', 0)) if e.get('key_attr') else 0
             nx_graph.add_edge(source_name, target_name, key=key, **edge_attrs)
         
         return nx_graph
