@@ -13,22 +13,6 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.logger import configure
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-import multiprocessing as mp
-from joblib import Parallel, delayed
-import concurrent.futures
-from functools import partial
-
-def make_env(G_osmnx, budget=10, reward_weights=None, seed=0):
-    """
-    Create a function that returns a parameterized environment instance
-    Used for vectorized environments
-    """
-    def _init():
-        env = BikePathEnvironment(G_osmnx, budget=budget, reward_weights=reward_weights)
-        env.seed(seed)
-        return env
-    return _init
 
 class BikePathEnvironment(gym.Env):
     """Custom Environment for bike path planning using RL"""
@@ -70,11 +54,6 @@ class BikePathEnvironment(gym.Env):
         
         # Initialize state
         self.state = self._get_state()
-    
-    def seed(self, seed=None):
-        """Set random seed for reproducibility"""
-        self.np_random, seed = gym.utils.seeding.np_random(seed)
-        return [seed]
     
     def _convert_to_igraph(self, G_osmnx):
         """Convert OSMnx graph to igraph format"""
@@ -119,12 +98,8 @@ class BikePathEnvironment(gym.Env):
         # 1. Bike path coverage (percentage of edges with bike paths)
         coverage = np.mean(self.bike_paths)
         
-        # Use parallel algorithms where possible in igraph
-        
         # 2. Average clustering coefficient (measure of local connectivity)
-        # Set parallel for multi-threading in transitivity calculation (n-1 cores)
-        num_parallel = max(1, mp.cpu_count() - 1)
-        clustering = np.mean(self.G_ig.transitivity_local_undirected(mode="zero", parallel=num_parallel))
+        clustering = np.mean(self.G_ig.transitivity_local_undirected(mode="zero"))
         
         # 3. Bike path connectivity (largest connected component of bike paths)
         # Create subgraph with only bike path edges
@@ -138,19 +113,8 @@ class BikePathEnvironment(gym.Env):
             connectivity = 0
         
         # 4. Centrality distribution (how central are the bike paths)
-        # Enable parallelism in betweenness calculation (n-1 cores)
-        num_parallel = max(1, mp.cpu_count() - 1)
-        centrality = self.G_ig.edge_betweenness(parallel=num_parallel)
-        
-        # Use numpy vectorized operations for better performance
-        min_centrality = np.min(centrality) if centrality else 0
-        max_centrality = np.max(centrality) if centrality else 1
-        range_centrality = max_centrality - min_centrality + 1e-10
-        
-        # Vectorized normalization is faster than element-wise
-        centrality_norm = (np.array(centrality) - min_centrality) / range_centrality
-        
-        # Use numpy's masked operations for conditional means
+        centrality = self.G_ig.edge_betweenness()
+        centrality_norm = (np.array(centrality) - min(centrality)) / (max(centrality) - min(centrality) + 1e-10)
         bike_path_centrality = np.mean(centrality_norm[self.bike_paths]) if np.any(self.bike_paths) else 0
         
         # 5. Directness (average path length improvement for bike riders)
@@ -253,14 +217,12 @@ class BikePathEnvironment(gym.Env):
         
         return self.state
     
-    def render(self, mode='human', filename=None, use_parallel=True, num_workers=max(1, mp.cpu_count() - 1)):
-        """Render the environment with optional parallelization
+    def render(self, mode='human', filename=None):
+        """Render the environment
 
         Args:
             mode (str): Rendering mode
             filename (str, optional): If provided, save figure to this file
-            use_parallel (bool): Whether to use parallel processing for rendering
-            num_workers (int, optional): Number of worker processes
         """
         # Create a figure and axis
         fig, ax = plt.subplots(figsize=(12, 10))
@@ -273,65 +235,21 @@ class BikePathEnvironment(gym.Env):
         for node, data in self.G_osmnx.nodes(data=True):
             node_coords[node] = (data['x'], data['y'])
         
-        if use_parallel and len(self.G_ig.es) > 1000:  # Only use parallel for large graphs
-            # Determine number of workers
-            # Use provided num_workers (default is mp.cpu_count() - 1)
-            
-            # Parallel processing for original graph edges
-            # Split edges into chunks for parallel processing
-            all_edges = list(self.G_ig.es)
-            chunk_size = max(1, len(all_edges) // num_workers)
-            edge_chunks = [all_edges[i:i+chunk_size] for i in range(0, len(all_edges), chunk_size)]
-            
-            # Function to process a chunk of edges
-            def process_edge_chunk(edges):
-                lines = []
-                for edge in edges:
-                    u, v = self.G_ig.vs[edge.source]["name"], self.G_ig.vs[edge.target]["name"]
-                    if u in node_coords and v in node_coords:
-                        x1, y1 = node_coords[u]
-                        x2, y2 = node_coords[v]
-                        lines.append(((x1, x2), (y1, y2)))
-                return lines
-            
-            # Process regular edges in parallel
-            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-                results = list(executor.map(process_edge_chunk, edge_chunks))
-            
-            # Plot all regular edges
-            for chunk_lines in results:
-                for (x1, x2), (y1, y2) in chunk_lines:
-                    ax.plot([x1, x2], [y1, y2], color='gray', alpha=0.3, linewidth=1)
-            
-            # Process bike path edges (typically fewer, so less benefit from parallelization)
-            bike_lines = []
-            for u, v in bike_edges:
-                u_name, v_name = self.G_ig.vs[u]["name"], self.G_ig.vs[v]["name"]
-                if u_name in node_coords and v_name in node_coords:
-                    x1, y1 = node_coords[u_name]
-                    x2, y2 = node_coords[v_name]
-                    bike_lines.append(((x1, x2), (y1, y2)))
-            
-            # Plot bike path edges
-            for (x1, x2), (y1, y2) in bike_lines:
+        # Plot original graph edges
+        for edge in self.G_ig.es:
+            u, v = self.G_ig.vs[edge.source]["name"], self.G_ig.vs[edge.target]["name"]
+            if u in node_coords and v in node_coords:
+                x1, y1 = node_coords[u]
+                x2, y2 = node_coords[v]
+                ax.plot([x1, x2], [y1, y2], color='gray', alpha=0.3, linewidth=1)
+        
+        # Plot bike path edges
+        for u, v in bike_edges:
+            u_name, v_name = self.G_ig.vs[u]["name"], self.G_ig.vs[v]["name"]
+            if u_name in node_coords and v_name in node_coords:
+                x1, y1 = node_coords[u_name]
+                x2, y2 = node_coords[v_name]
                 ax.plot([x1, x2], [y1, y2], color='green', linewidth=2)
-        else:
-            # Sequential rendering for smaller graphs
-            # Plot original graph edges
-            for edge in self.G_ig.es:
-                u, v = self.G_ig.vs[edge.source]["name"], self.G_ig.vs[edge.target]["name"]
-                if u in node_coords and v in node_coords:
-                    x1, y1 = node_coords[u]
-                    x2, y2 = node_coords[v]
-                    ax.plot([x1, x2], [y1, y2], color='gray', alpha=0.3, linewidth=1)
-            
-            # Plot bike path edges
-            for u, v in bike_edges:
-                u_name, v_name = self.G_ig.vs[u]["name"], self.G_ig.vs[v]["name"]
-                if u_name in node_coords and v_name in node_coords:
-                    x1, y1 = node_coords[u_name]
-                    x2, y2 = node_coords[v_name]
-                    ax.plot([x1, x2], [y1, y2], color='green', linewidth=2)
         
         # Add a legend
         ax.plot([], [], color='green', linewidth=2, label='Proposed Bike Paths')
@@ -351,8 +269,6 @@ class BikePathEnvironment(gym.Env):
         
         plt.close(fig)
         return None
-
-# Ray Remote function for distributed graph processing was removed
 
 def get_city_network(city, distance=3000, retry_with_drive=True):
     """Get OSMnx network for a city with given distance from center
@@ -402,118 +318,44 @@ def get_city_network(city, distance=3000, retry_with_drive=True):
     
     return G
 
-def parallel_evaluate_model(env, model, n_episodes=3, n_jobs=-1):
-    """Parallel evaluation of model on multiple episodes
-    
-    Args:
-        env (BikePathEnvironment): Environment to evaluate
-        model: Model to evaluate
-        n_episodes (int): Number of episodes
-        n_jobs (int): Number of parallel jobs (-1 for all cores)
-        
-    Returns:
-        list: Rewards for each episode
-    """
-    # Create a partial function for evaluation
-    def evaluate_episode(ep):
-        env_copy = BikePathEnvironment(
-            env.G_osmnx, 
-            budget=env.budget, 
-            reward_weights=env.reward_weights
-        )
-        obs = env_copy.reset()
-        done = False
-        total_reward = 0
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, _ = env_copy.step(action)
-            total_reward += reward
-        return total_reward
-    
-    # Use joblib to parallelize evaluation
-    rewards = Parallel(n_jobs=n_jobs)(
-        delayed(evaluate_episode)(ep) for ep in range(n_episodes)
-    )
-    
-    return rewards
-
-def evaluate_bike_network(env, model=None, progress_bar=True, parallel=True):
+def evaluate_bike_network(env, model=None, progress_bar=True):
     """Evaluate bike network quality with or without RL model
     
     Args:
         env (BikePathEnvironment): Environment to evaluate
         model (stable_baselines3.PPO, optional): Model to use for suggesting bike paths
         progress_bar (bool): Whether to show progress bar during evaluation
-        parallel (bool): Whether to use parallel processing
         
     Returns:
         dict: Metrics including coverage, connectivity, and directness
     """
     if model:
-        if parallel:
-            # Use parallel evaluation
-            env_copy = BikePathEnvironment(
-                env.G_osmnx, 
-                budget=env.budget, 
-                reward_weights=env.reward_weights
-            )
-            obs = env_copy.reset()
-            done = False
+        # Use trained model to suggest bike paths
+        obs = env.reset()
+        done = False
+        steps = 0
+        budget = env.budget
+        
+        if progress_bar:
+            pbar = tqdm(total=budget, desc="Evaluating with model")
+        
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            prev_obs = obs
+            obs, reward, done, info = env.step(action)
             
-            if progress_bar:
-                pbar = tqdm(total=env_copy.budget, desc="Evaluating with model")
-            
-            # Process actions in batches for better parallelism
-            while not done:
-                # Get next action from model
-                action, _ = model.predict(obs, deterministic=True)
-                
-                # Take step in environment
-                prev_obs = obs
-                obs, reward, done, info = env_copy.step(action)
-                
-                # Only update progress if action was valid
-                if not info.get('invalid_action', False) and progress_bar:
+            # Only update progress if action was valid
+            if not info.get('invalid_action', False):
+                steps += 1
+                if progress_bar:
                     pbar.update(1)
                     pbar.set_postfix({"reward": f"{reward:.2f}"})
-            
-            if progress_bar:
-                pbar.close()
-                
-            # Calculate metrics on final network
-            final_state = env_copy._get_state()
-        else:
-            # Use regular evaluation
-            obs = env.reset()
-            done = False
-            steps = 0
-            budget = env.budget
-            
-            if progress_bar:
-                pbar = tqdm(total=budget, desc="Evaluating with model")
-            
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                prev_obs = obs
-                obs, reward, done, info = env.step(action)
-                
-                # Only update progress if action was valid
-                if not info.get('invalid_action', False):
-                    steps += 1
-                    if progress_bar:
-                        pbar.update(1)
-                        pbar.set_postfix({"reward": f"{reward:.2f}"})
-            
-            if progress_bar:
-                pbar.close()
-            
-            # Calculate metrics on final network
-            final_state = env._get_state()
-    else:
-        # Just get current state if no model is provided
-        final_state = env._get_state()
+        
+        if progress_bar:
+            pbar.close()
     
-    # Extract metrics
+    # Calculate metrics on final network
+    final_state = env._get_state()
     coverage = final_state[0]
     connectivity = final_state[2]
     directness = final_state[4]
@@ -547,18 +389,14 @@ def save_bike_network_to_geojson(env, filename):
     for node, data in env.G_osmnx.nodes(data=True):
         node_coords[node] = (data['x'], data['y'])
     
-    # Function to process a single edge
-    def process_edge(edge):
+    # Create LineStrings for bike paths
+    geometries = []
+    for edge in bike_edges:
         u, v = env.G_ig.vs[edge.source]["name"], env.G_ig.vs[edge.target]["name"]
         if u in node_coords and v in node_coords:
             x1, y1 = node_coords[u]
             x2, y2 = node_coords[v]
-            return LineString([(x1, y1), (x2, y2)])
-        return None
-    
-    # Parallel processing of edges
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        geometries = list(filter(None, executor.map(process_edge, bike_edges)))
+            geometries.append(LineString([(x1, y1), (x2, y2)]))
     
     # Create GeoDataFrame
     gdf = gpd.GeoDataFrame(geometry=geometries)
@@ -592,35 +430,17 @@ def create_interactive_map(env, filename):
     for node, data in env.G_osmnx.nodes(data=True):
         node_coords[node] = (data['y'], data['x'])  # Note lat/lon order
     
-    # Function to process an edge batch for parallel execution
-    def process_edge_batch(edges_batch):
-        polylines = []
-        for edge in edges_batch:
-            u, v = env.G_ig.vs[edge.source]["name"], env.G_ig.vs[edge.target]["name"]
-            if u in node_coords and v in node_coords:
-                polylines.append((node_coords[u], node_coords[v]))
-        return polylines
-    
-    # Split edges into batches for parallel processing
-    batch_size = max(1, len(bike_edges) // mp.cpu_count())
-    edge_batches = [bike_edges[i:i+batch_size] for i in range(0, len(bike_edges), batch_size)]
-    
-    # Process edge batches in parallel
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        all_polylines = list(executor.map(process_edge_batch, edge_batches))
-    
-    # Flatten the list of polylines
-    polylines = [item for sublist in all_polylines for item in sublist]
-    
-    # Add polylines to map
-    for coords in polylines:
-        folium.PolyLine(
-            coords,
-            color='green',
-            weight=4,
-            opacity=0.8,
-            tooltip='Proposed Bike Path'
-        ).add_to(m)
+    # Add bike paths to map
+    for edge in bike_edges:
+        u, v = env.G_ig.vs[edge.source]["name"], env.G_ig.vs[edge.target]["name"]
+        if u in node_coords and v in node_coords:
+            folium.PolyLine(
+                [node_coords[u], node_coords[v]],
+                color='green',
+                weight=4,
+                opacity=0.8,
+                tooltip='Proposed Bike Path'
+            ).add_to(m)
     
     # Save the map
     m.save(filename)
@@ -678,48 +498,15 @@ def parse_arguments():
     parser.add_argument("--save_freq", type=int, default=1000,
                         help="Frequency of saving model checkpoints (in timesteps)")
     
-    # Parallelization options
-    parser.add_argument("--num_envs", type=int, default=max(1, mp.cpu_count() - 1),
-                        help="Number of parallel environments for training")
-    parser.add_argument("--num_eval_processes", type=int, default=max(1, mp.cpu_count() - 1),
-                        help="Number of parallel processes for evaluation")
-    
     # Visualization options
     parser.add_argument("--render", action="store_true",
                         help="Render final result")
-    parser.add_argument("--interactive_map", action="store_true",
-                        help="Create interactive map")
-    parser.add_argument("--export_geojson", action="store_true",
-                        help="Export bike paths as GeoJSON")
     
     return parser.parse_args()
 
 def main():
     # 0. Parse arguments
     args = parse_arguments()
-    
-    # Automatically adjust num_envs and num_eval_processes if not explicitly set
-    if args.num_envs == max(1, mp.cpu_count() - 1):  # If using the default value
-        recommended_cores = max(1, mp.cpu_count() - 1)
-        args.num_envs = recommended_cores
-        print(f"Automatically using {recommended_cores} cores for environments (keeping 1 core free)")
-    
-    if args.num_eval_processes == max(1, mp.cpu_count() - 1):  # If using the default value
-        recommended_cores = max(1, mp.cpu_count() - 1)
-        args.num_eval_processes = recommended_cores
-        print(f"Automatically using {recommended_cores} cores for evaluation (keeping 1 core free)")
-    
-    # Print system info for parallelization
-    print(f"System information:")
-    print(f"  CPU cores available: {mp.cpu_count()}")
-    print(f"  Cores used for environments: {args.num_envs}")
-    print(f"  Cores used for evaluation: {args.num_eval_processes}")
-    print(f"  Python multiprocessing start method: {mp.get_start_method(allow_none=True)}")
-    
-    # Set environment variables for better parallelization
-    os.environ["OMP_NUM_THREADS"] = str(1)  # Limit OpenMP threads
-    os.environ["MKL_NUM_THREADS"] = str(1)  # Limit MKL threads
-    os.environ["NUMEXPR_NUM_THREADS"] = str(1)  # Limit numexpr threads
     
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -733,8 +520,6 @@ def main():
     print(f"  Budget: {args.budget}")
     print(f"  Training timesteps: {args.timesteps}")
     print(f"  Evaluation episodes: {args.eval_episodes}")
-    print(f"  Parallel environments: {args.num_envs}")
-    print(f"  Evaluation processes: {args.num_eval_processes}")
     
     # 1. Get city network
     print(f"Downloading street network for {args.city}...")
@@ -747,43 +532,34 @@ def main():
         "coverage": args.coverage_weight
     }
     
-    # 2. Create vectorized environment for parallel training
-    print(f"Creating {args.num_envs} parallel environments with budget of {args.budget} bike paths...")
-    
-    # Create environment creation functions
-    env_fns = [make_env(G, budget=args.budget, reward_weights=reward_weights, seed=i) 
-              for i in range(args.num_envs)]
-    
-    # Create vectorized environment
-    train_env = SubprocVecEnv(env_fns)
-    
-    # Create a single environment for evaluation and visualization
-    eval_env = BikePathEnvironment(G, budget=args.budget, reward_weights=reward_weights)
+    # 2. Create environment
+    print(f"Creating environment with budget of {args.budget} bike paths...")
+    env = BikePathEnvironment(G, budget=args.budget, reward_weights=reward_weights)
     
     # Set up model directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_dir = os.path.join(args.model_dir, f"{args.city.split(',')[0]}_{timestamp}")
     os.makedirs(model_dir, exist_ok=True)
     
     # Set up callbacks
     progress_callback = ProgressCallback()
     checkpoint_callback = CheckpointCallback(
-        save_freq=args.save_freq // args.num_envs,  # Adjust save frequency for vectorized environment
+        save_freq=args.save_freq,
         save_path=model_dir,
         name_prefix="bike_path_model"
     )
     
-    # 3. Set up RL model with parallelized training
-    print("Initializing PPO model with parallel environments...")
-    model = PPO("MlpPolicy", train_env, verbose=1, 
+    # 3. Set up RL model (PPO)
+    print("Initializing PPO model...")
+    model = PPO("MlpPolicy", env, verbose=1, 
                 learning_rate=0.0003,
                 gamma=0.99,
-                n_steps=2048 // args.num_envs,  # Adjust steps for vectorized env
+                n_steps=2048,
                 ent_coef=0.01,
-                n_epochs=10,  # Increase training epochs
                 device="cpu")
     
     # 4. Train model
-    print(f"Starting training for {args.timesteps} timesteps using {args.num_envs} parallel environments...")
+    print(f"Starting training for {args.timesteps} timesteps...")
     model.learn(
         total_timesteps=args.timesteps,
         callback=[progress_callback, checkpoint_callback]
@@ -794,18 +570,160 @@ def main():
     model.save(final_model_path)
     print(f"Model saved to {final_model_path}")
     
-    # 5. Evaluate model in parallel
-    print(f"Evaluating model over {args.eval_episodes} episodes using {args.num_eval_processes} processes...")
-    
-    # Joblib-based parallel evaluation
-    rewards = parallel_evaluate_model(
-        eval_env, model, 
-        n_episodes=args.eval_episodes, 
-        n_jobs=args.num_eval_processes
-    )
-    mean_reward = np.mean(rewards)
-    
+    # 5. Evaluate and visualize results
+    print(f"Evaluating model over {args.eval_episodes} episodes...")
+    mean_reward, _ = evaluate_policy(model, env, n_eval_episodes=args.eval_episodes)
     print(f"Mean reward: {mean_reward:.2f}")
+    
+    # 6. Generate bike path recommendations using trained model
+    print("Generating bike path recommendations...")
+    obs = env.reset()
+    done = False
+    total_reward = 0
+    actions_taken = []
+    
+    # Step through environment using trained policy with progress tracking
+    with tqdm(total=args.budget, desc="Adding bike paths") as pbar:
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, _ = env.step(action)
+            total_reward += reward
+            actions_taken.append(action)
+            pbar.update(1)
+            pbar.set_postfix({"reward": f"{reward:.2f}"})
+    
+    print(f"Total reward: {total_reward:.2f}")
+    
+    # 7. Render final result and save visualizations
+    map_path = os.path.join(output_dir, "bike_network_map.png")
+    env.render(filename=map_path)
+    
+    if args.interactive_map:
+        try:
+            interactive_map_path = os.path.join(output_dir, "interactive_map.html")
+            create_interactive_map(env, interactive_map_path)
+        except ImportError:
+            print("Could not create interactive map. Make sure folium is installed.")
+    
+    if args.export_geojson:
+        try:
+            geojson_path = os.path.join(output_dir, "bike_paths.geojson")
+            save_bike_network_to_geojson(env, geojson_path)
+        except ImportError:
+            print("Could not export GeoJSON. Make sure geopandas is installed.")
+    
+    # 8. Evaluate final bike network
+    print("Evaluating final bike network...")
+    metrics = evaluate_bike_network(env)
+    
+    # 9. Compare with random baseline
+    print("\nComparing with random baseline...")
+    random_env = BikePathEnvironment(G, budget=args.budget, reward_weights=reward_weights)
+    
+    # Random actions with progress tracking
+    obs = random_env.reset()
+    done = False
+    with tqdm(total=args.budget, desc="Random baseline") as pbar:
+        while not done:
+            action = random_env.action_space.sample()
+            # Skip if invalid action (already has bike path)
+            while random_env.bike_paths[action]:
+                action = random_env.action_space.sample()
+            obs, reward, done, _ = random_env.step(action)
+            pbar.update(1)
+    
+    # Save random baseline visualization
+    random_map_path = os.path.join(output_dir, "random_baseline_map.png")
+    random_env.render(filename=random_map_path)
+    
+    random_metrics = evaluate_bike_network(random_env)
+    
+    # Print comparison
+    print("\nMetrics Comparison:")
+    print(f"RL Model vs Random:")
+    print(f"Coverage: {metrics['coverage']:.2f} vs {random_metrics['coverage']:.2f}")
+    print(f"Connectivity: {metrics['connectivity']:.2f} vs {random_metrics['connectivity']:.2f}")
+    print(f"Directness: {metrics['directness']:.2f} vs {random_metrics['directness']:.2f}")
+    
+    # Save recommendation results
+    results = {
+        "city": args.city,
+        "budget": args.budget,
+        "rl_metrics": metrics,
+        "random_metrics": random_metrics,
+        "actions": actions_taken,
+        "visualizations": {
+            "map": map_path,
+            "random_map": random_map_path
+        }
+    }
+    
+    # Detailed results summary
+    results_path = os.path.join(output_dir, "results.txt")
+    with open(results_path, 'w') as f:
+        f.write(f"Bike Path Planning Results Summary\n")
+        f.write(f"===============================\n\n")
+        f.write(f"City: {args.city}\n")
+        f.write(f"Budget: {args.budget}\n")
+        f.write(f"Training timesteps: {args.timesteps}\n")
+        f.write(f"Model directory: {model_dir}\n\n")
+        
+        f.write("Network Statistics:\n")
+        f.write(f"  Nodes: {len(env.G_osmnx.nodes)}\n")
+        f.write(f"  Edges: {len(env.G_osmnx.edges)}\n\n")
+        
+        f.write("RL Model Metrics:\n")
+        f.write(f"  Coverage: {metrics['coverage']:.2f}\n")
+        f.write(f"  Connectivity: {metrics['connectivity']:.2f}\n")
+        f.write(f"  Directness: {metrics['directness']:.2f}\n\n")
+        
+        f.write("Random Baseline Metrics:\n")
+        f.write(f"  Coverage: {random_metrics['coverage']:.2f}\n")
+        f.write(f"  Connectivity: {random_metrics['connectivity']:.2f}\n")
+        f.write(f"  Directness: {random_metrics['directness']:.2f}\n\n")
+        
+        f.write("Improvement (RL vs Random):\n")
+        f.write(f"  Coverage: {(metrics['coverage'] - random_metrics['coverage']):.2f}\n")
+        f.write(f"  Connectivity: {(metrics['connectivity'] - random_metrics['connectivity']):.2f}\n")
+        f.write(f"  Directness: {(metrics['directness'] - random_metrics['directness']):.2f}\n\n")
+        
+        f.write("Files:\n")
+        f.write(f"  RL Model map: {map_path}\n")
+        f.write(f"  Random baseline map: {random_map_path}\n")
+        if args.interactive_map:
+            f.write(f"  Interactive map: {interactive_map_path}\n")
+        if args.export_geojson:
+            f.write(f"  GeoJSON: {geojson_path}\n")
+    
+    print(f"Results saved to {results_path}")
+    
+    # Create a README with instructions for using the model
+    readme_path = os.path.join(output_dir, "README.md")
+    with open(readme_path, 'w') as f:
+        f.write(f"# Bike Path Planning Model for {args.city}\n\n")
+        f.write(f"This model was trained on {datetime.now().strftime('%Y-%m-%d')} using {args.timesteps} timesteps.\n\n")
+        f.write("## Usage\n\n")
+        f.write("To use this model for inference on new data:\n\n")
+        f.write("```python\n")
+        f.write("from stable_baselines3 import PPO\n")
+        f.write("import osmnx as ox\n\n")
+        f.write("# Load the trained model\n")
+        f.write(f"model = PPO.load('{os.path.join(model_dir, 'final_model')}')\n\n")
+        f.write("# Create a new environment for a different city\n")
+        f.write("new_city = 'Your City, Country'\n")
+        f.write("G = ox.graph_from_place(new_city, network_type='bike')\n")
+        f.write("env = BikePathEnvironment(G, budget=20)\n\n")
+        f.write("# Generate recommendations\n")
+        f.write("obs = env.reset()\n")
+        f.write("done = False\n")
+        f.write("while not done:\n")
+        f.write("    action, _ = model.predict(obs, deterministic=True)\n")
+        f.write("    obs, reward, done, _ = env.step(action)\n\n")
+        f.write("# Visualize results\n")
+        f.write("env.render()\n")
+        f.write("```\n")
+        
+    print(f"Usage instructions saved to {readme_path}")
     
 if __name__ == "__main__":
     # Add additional visualization arguments
