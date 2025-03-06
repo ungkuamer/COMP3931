@@ -197,8 +197,8 @@ class BikePathEnv(gym.Env):
         result = cp.zeros(n, dtype=cp.float32)
         
         # Configure CUDA grid
-        threads_per_block = 512
-        min_blocks = 32
+        threads_per_block = 256
+        min_blocks = 60 * 4 # 60 SMs * 4 blocks per SM
         blocks_per_grid = max(min_blocks, (n + threads_per_block - 1) // threads_per_block)
         
         print(f"CUDA grid configuration: {blocks_per_grid} blocks with {threads_per_block} threads each")
