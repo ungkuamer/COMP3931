@@ -1,0 +1,11 @@
+osmnx
+networkx
+numpy
+pandas
+matplotlib
+geopandas
+shapely
+gym
+tqdm
+stable-baselines3
+shimmy
