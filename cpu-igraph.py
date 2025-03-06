@@ -707,10 +707,19 @@ class BikePathEnv(gym.Env):
             edge_data = data.copy()
             edge_data['bike_lane'] = 'yes'  # Mark as bike path
             
-            # Add the edge with all attributes
+            # Add the edge with attributes
             e_idx = self.graph.add_edge(source_idx, target_idx)
-            for attr, value in edge_data.items():
-                self.graph.es[e_idx][attr] = value
+            edge = self.graph.es[e_idx]
+            
+            # Set edge attributes one by one to avoid type errors
+            for attr_name, attr_value in edge_data.items():
+                if isinstance(attr_name, str):  # Ensure attribute name is a string
+                    try:
+                        edge[attr_name] = attr_value
+                    except Exception as e:
+                        print(f"Error setting edge attribute {attr_name}: {e}")
+                else:
+                    print(f"Skipping non-string attribute name: {type(attr_name)}")
                 
             # Store the added path for visualization
             self.added_paths.append((osm_source, osm_target, edge_data['length']))
