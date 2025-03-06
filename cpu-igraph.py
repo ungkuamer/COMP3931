@@ -1,4 +1,5 @@
 import osmnx as ox
+import igraph as ig
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -10,7 +11,6 @@ import random
 import time
 import sys
 import os
-import igraph as ig
 from multiprocessing import Pool, cpu_count
 import itertools
 from datetime import datetime
@@ -26,7 +26,7 @@ class BikePathEnv(gym.Env):
     
     This environment uses real city street networks from OSMnx and allows an RL agent
     to suggest optimal bike path additions based on metrics like connectivity, safety,
-    and route directness. Uses igraph for enhanced performance.
+    and route directness. Implementation uses igraph for better performance.
     """
     
     def __init__(self, city_name, budget=1000, edge_cost_factor=10):
@@ -34,26 +34,29 @@ class BikePathEnv(gym.Env):
         
         print(f"Initializing environment for {city_name}")
         
-        # Load the city graph using OSMnx but convert to igraph
+        # Load the city graph using OSMnx (still needed for initial data)
         self.nx_original_graph = ox.graph_from_place(city_name, network_type='bike')
         self.city_name = city_name
         
-        # Convert NetworkX graph to igraph
-        self.original_graph = self._convert_nx_to_igraph(self.nx_original_graph)
+        # Convert to igraph for better performance
+        self.original_graph = self._networkx_to_igraph(self.nx_original_graph)
         
         # Create a working copy of the graph
         self.graph = self.original_graph.copy()
         
         # Get all roads that don't already have bike infrastructure
         self.nx_walk_graph = ox.graph_from_place(city_name, network_type='walk')
-        self.walk_graph = self._convert_nx_to_igraph(self.nx_walk_graph)
+        self.walk_graph = self._networkx_to_igraph(self.nx_walk_graph)
         
         # Add better validation of graphs
-        print(f"Original bike graph: {self.graph.vcount()} nodes, {self.graph.ecount()} edges")
+        print(f"Original bike graph: {self.original_graph.vcount()} nodes, {self.original_graph.ecount()} edges")
         print(f"Walk graph: {self.walk_graph.vcount()} nodes, {self.walk_graph.ecount()} edges")
         
         # Verify graph attributes
         self._validate_graph_attributes()
+        
+        # Store node mapping for later use
+        self.node_map = self._create_node_mapping()
         
         # Identify candidate edges for bike path addition
         self.candidate_edges = self._get_candidate_edges()
@@ -80,77 +83,61 @@ class BikePathEnv(gym.Env):
         self.episode_rewards = []
         self.episode_lengths = []
         
-        # Store node mapping for later reference
-        self.node_map = {}  # Maps original OSM IDs to igraph vertex indices
-        
         # Print initial state
         print("Initial state:", self.state)
 
-    def _convert_nx_to_igraph(self, nx_graph):
-        """Convert NetworkX graph to igraph."""
-        # Create a new igraph Graph
+    def _networkx_to_igraph(self, nx_graph):
+        """Convert NetworkX graph to igraph for better performance."""
+        # Create empty igraph
         g = ig.Graph(directed=nx_graph.is_directed())
         
-        # Reset the node map
-        self.node_map = {}
+        # Add nodes
+        node_mapping = {}  # Maps OSM node IDs to igraph vertex indices
+        for i, node_id in enumerate(nx_graph.nodes()):
+            g.add_vertices(1)
+            v = g.vs[i]
+            
+            # Store original node ID as attribute
+            v['osmid'] = node_id
+            node_mapping[node_id] = i
+            
+            # Copy node attributes
+            node_attrs = nx_graph.nodes[node_id]
+            for key, value in node_attrs.items():
+                v[key] = value
         
-        # Add vertices with attributes
-        for i, (node, attrs) in enumerate(nx_graph.nodes(data=True)):
-            # Store the mapping from original ID to vertex index
-            self.node_map[node] = i
-            
-            # Add vertex with attributes
-            g.add_vertex(name=str(node))
-            
-            # Add node attributes - ensure they're valid for igraph
-            for k, v in attrs.items():
-                if isinstance(k, str):  # Only string attribute names are supported
+        # Add edges
+        for u, v, data in nx_graph.edges(data=True):
+            if u in node_mapping and v in node_mapping:  # Ensure nodes exist
+                e = g.add_edge(node_mapping[u], node_mapping[v])
+                
+                # Copy edge attributes
+                for key, value in data.items():
+                    e[key] = value
+                    
+                # Make sure length attribute exists
+                if 'length' not in data:
                     try:
-                        g.vs[i][k] = v
-                    except TypeError:
-                        # If the value type is not supported, convert to string
-                        try:
-                            g.vs[i][k] = str(v)
-                        except:
-                            pass
-        
-        # Add edges with attributes
-        edge_count = 0
-        for u, v, key, attrs in nx_graph.edges(data=True, keys=True):
-            try:
-                # Get corresponding vertex indices
-                u_idx = self.node_map[u]
-                v_idx = self.node_map[v]
-                
-                # Add edge
-                edge_id = g.add_edge(u_idx, v_idx)
-                edge_count += 1
-                
-                # Add edge attributes - ensure they're valid for igraph
-                for k, v in attrs.items():
-                    if isinstance(k, str):  # Only string attribute names are supported
-                        try:
-                            # Handle common types that might cause issues
-                            if isinstance(v, list) and len(v) > 0:
-                                # Convert lists to strings to avoid type issues
-                                g.es[edge_id][k] = str(v)
-                            elif v is not None:
-                                g.es[edge_id][k] = v
-                        except TypeError as e:
-                            # Skip with a warning instead of failing
-                            pass
-                
-                # Store the key as a string attribute to avoid type issues
-                g.es[edge_id]["key_attr"] = str(key)
-                
-            except Exception as e:
-                print(f"Error adding edge {u} -> {v}: {e}")
-                continue
-                
-        print(f"Added {edge_count} edges to igraph")
-        return g
+                        u_coords = (nx_graph.nodes[u]['y'], nx_graph.nodes[u]['x'])
+                        v_coords = (nx_graph.nodes[v]['y'], nx_graph.nodes[v]['x'])
+                        e['length'] = ox.distance.great_circle(u_coords, v_coords)
+                    except Exception as e:
+                        print(f"Error calculating length for edge ({u}, {v}): {e}")
+                        e['length'] = 100.0  # Default value
         
         return g
+
+    def _create_node_mapping(self):
+        """Create a bidirectional mapping between OSM IDs and igraph vertex indices."""
+        node_map = {}
+        reverse_map = {}
+        
+        for v in self.graph.vs:
+            osmid = v['osmid']
+            node_map[osmid] = v.index
+            reverse_map[v.index] = osmid
+            
+        return {'osm_to_ig': node_map, 'ig_to_osm': reverse_map}
 
     def _validate_graph_attributes(self):
         """Validate and fix graph attributes."""
@@ -159,22 +146,20 @@ class BikePathEnv(gym.Env):
         # Check and fix node attributes
         for v in self.graph.vs:
             if 'x' not in v.attributes() or 'y' not in v.attributes():
-                print(f"Warning: Node {v['name']} missing coordinates")
-                # Try to find in walk graph
-                try:
-                    walk_node_idx = self.node_map.get(v['name'])
-                    if walk_node_idx is not None:
-                        walk_v = self.walk_graph.vs[walk_node_idx]
-                        if 'x' in walk_v.attributes() and 'y' in walk_v.attributes():
-                            v['x'] = walk_v['x']
-                            v['y'] = walk_v['y']
-                except:
-                    pass
+                print(f"Warning: Node {v['osmid']} missing coordinates")
+                # Try to get coordinates from walk graph
+                osmid = v['osmid']
+                walk_vertices = self.walk_graph.vs.select(osmid_eq=osmid)
+                if walk_vertices:
+                    walk_v = walk_vertices[0]
+                    if 'x' in walk_v.attributes() and 'y' in walk_v.attributes():
+                        v['x'] = walk_v['x']
+                        v['y'] = walk_v['y']
         
         # Check and fix edge attributes
         for e in self.graph.es:
             if 'length' not in e.attributes() or e['length'] <= 0:
-                print(f"Warning: Edge ({e.source}, {e.target}) missing length attribute")
+                print(f"Warning: Edge {e.source}-{e.target} missing or invalid length attribute")
                 # Calculate length using node coordinates
                 try:
                     source_v = self.graph.vs[e.source]
@@ -182,39 +167,31 @@ class BikePathEnv(gym.Env):
                     u_coords = (source_v['y'], source_v['x'])
                     v_coords = (target_v['y'], target_v['x'])
                     e['length'] = ox.distance.great_circle(u_coords, v_coords)
-                except Exception as err:
-                    print(f"Error calculating length for edge ({e.source}, {e.target}): {err}")
-        
+                except Exception as ex:
+                    print(f"Error calculating length for edge {e.source}-{e.target}: {ex}")
+                    e['length'] = 100.0  # Default value
+
     def _calculate_node_clustering(self, args):
         """Calculate clustering coefficient for a single node."""
-        G, node_idx = args
+        G, node_index = args
         try:
-            # This is now using igraph's built-in transitivity (clustering) function
-            return G.transitivity_local_undirected([node_idx])[0]
+            # In igraph, this is much simpler
+            return G.transitivity_local_undirected(vertices=[node_index])[0]
         except Exception as e:
-            print(f"Error calculating clustering for node {node_idx}: {e}")
+            print(f"Error calculating clustering for node {node_index}: {e}")
             return 0.0
         
     def _calculate_path_lengths_chunk(self, args):
         """Calculate path lengths for a chunk of node pairs."""
         G, node_pairs = args
         lengths = []
-        for u_idx, v_idx in node_pairs:
+        for u, v in node_pairs:
             try:
-                # Make sure all edges have valid length values before calculating paths
-                valid_weights = True
-                for e in G.es:
-                    if 'length' not in e.attributes() or not isinstance(e['length'], (int, float)) or e['length'] <= 0:
-                        e['length'] = 1.0
-                
-                # igraph's shortest_paths returns a matrix, we need [0][0] for first pair
-                path_length = G.shortest_paths(source=u_idx, target=v_idx, weights='length')[0][0]
-                if path_length > 0 and path_length != float('inf'):
-                    lengths.append(path_length)
+                # igraph's shortest paths returns distance matrix
+                length = G.shortest_paths(source=u, target=v, weights='length')[0][0]
+                if length > 0:
+                    lengths.append(length)
             except Exception as e:
-                # Print helpful debug information for the first few errors
-                if len(lengths) < 5:
-                    print(f"Error calculating path length between {u_idx} and {v_idx}: {e}")
                 continue
         return lengths
                
@@ -223,67 +200,56 @@ class BikePathEnv(gym.Env):
         candidates = []
         print("Finding candidate edges...")
         
-        # Prepare a set of existing bike edges for quick lookup
-        # We need to convert from igraph edge indices to (source, target) tuples
+        # Get existing bike edges as set of (source_osmid, target_osmid) pairs
         bike_edges = set()
         for e in self.original_graph.es:
-            source_name = self.original_graph.vs[e.source]['name']
-            target_name = self.original_graph.vs[e.target]['name']
-            bike_edges.add((source_name, target_name))
-            bike_edges.add((target_name, source_name))  # Add reverse direction
-            
+            source_osmid = self.original_graph.vs[e.source]['osmid']
+            target_osmid = self.original_graph.vs[e.target]['osmid']
+            bike_edges.add((source_osmid, target_osmid))
+            bike_edges.add((target_osmid, source_osmid))  # Add both directions for undirected matching
+        
         validation_errors = 0
         
         # Iterate through walkable edges
         for e in self.walk_graph.es:
             try:
-                source_name = self.walk_graph.vs[e.source]['name']
-                target_name = self.walk_graph.vs[e.target]['name']
+                source_osmid = self.walk_graph.vs[e.source]['osmid']
+                target_osmid = self.walk_graph.vs[e.target]['osmid']
                 
-                if (source_name, target_name) not in bike_edges and (target_name, source_name) not in bike_edges:
-                    data = {}
-                # Safely get edge attributes
-                try:
+                # Check if this edge doesn't exist in bike network
+                if (source_osmid, target_osmid) not in bike_edges:
+                    # Get edge data
                     data = e.attributes()
-                except Exception as e_attr:
-                    print(f"Error getting edge attributes: {e_attr}")
-                    # Create minimal attributes if getting all fails
-                    data = {}
-                    for attr_name in ['length', 'highway']:
-                        try:
-                            if attr_name in e.attribute_names():
-                                data[attr_name] = e[attr_name]
-                        except:
-                            pass
+                    
+                    # Validate road type
+                    road_type = data.get('highway', '')
+                    if isinstance(road_type, list):
+                        road_type = road_type[0] if road_type else ''
+                    
+                    suitable_types = {'residential', 'tertiary', 'secondary', 'primary', 
+                                    'unclassified', 'living_street'}
+                    
+                    if road_type in suitable_types:
+                        # Validate node coordinates
+                        source_v = self.walk_graph.vs[e.source]
+                        target_v = self.walk_graph.vs[e.target]
+                        u_coords = (source_v.get('y'), source_v.get('x'))
+                        v_coords = (target_v.get('y'), target_v.get('x'))
                         
-                        # Validate road type
-                        road_type = data.get('highway', '')
-                        if isinstance(road_type, list):
-                            road_type = road_type[0] if road_type else ''
-                        
-                        suitable_types = {'residential', 'tertiary', 'secondary', 'primary', 
-                                        'unclassified', 'living_street'}
-                        
-                        if road_type in suitable_types:
-                            # Validate node coordinates
-                            source_v = self.walk_graph.vs[e.source]
-                            target_v = self.walk_graph.vs[e.target]
+                        if all(u_coords) and all(v_coords):
+                            # Calculate or validate length
+                            if 'length' not in data or data['length'] <= 0:
+                                data['length'] = ox.distance.great_circle(u_coords, v_coords)
                             
-                            u_coords = (source_v.get('y'), source_v.get('x'))
-                            v_coords = (target_v.get('y'), target_v.get('x'))
+                            # Additional validation
+                            if data['length'] > 0 and data['length'] < 500:  # Max 500m segments
+                                # Store the candidate with igraph indices and OSM IDs
+                                candidates.append((e.source, e.target, source_osmid, target_osmid, data))
                             
-                            if all(u_coords) and all(v_coords):
-                                # Calculate or validate length
-                                if 'length' not in data:
-                                    data['length'] = ox.distance.great_circle(u_coords, v_coords)
-                                
-                                # Additional validation
-                                if data['length'] > 0 and data['length'] < 500:  # Max 500m segments
-                                    candidates.append((e.source, e.target, data))
-                            else:
-                                validation_errors += 1
-                                if validation_errors < 10:  # Limit error messages
-                                    print(f"Warning: Missing coordinates for edge ({e.source}, {e.target})")
+                        else:
+                            validation_errors += 1
+                            if validation_errors < 10:  # Limit error messages
+                                print(f"Warning: Missing coordinates for edge {source_osmid}-{target_osmid}")
             except Exception as e:
                 validation_errors += 1
                 if validation_errors < 10:
@@ -302,12 +268,13 @@ class BikePathEnv(gym.Env):
             if self.graph.vcount() == 0 or self.graph.ecount() == 0:
                 print("Warning: Graph has no nodes or edges")
                 return 0.0, 0.0
+                
+            # Get largest connected component - much more efficient in igraph
+            components = self.graph.clusters(mode='weak')
+            largest_comp_idx = np.argmax(components.sizes())
+            subgraph = self.graph.subgraph(components[largest_comp_idx])
             
-            # Get largest connected component using igraph
-            components = self.graph.clusters()
-            largest_cc = components.giant()
-            
-            if largest_cc.vcount() == 0:
+            if subgraph.vcount() == 0:
                 print("Warning: Largest component has no nodes")
                 return 0.0, 0.0
             
@@ -315,16 +282,24 @@ class BikePathEnv(gym.Env):
             n_processes = max(1, cpu_count() - 1)
             print(f"Using {n_processes} processes for parallel computation")
             
-            # Calculate average clustering using igraph's built-in function
-            clustering = largest_cc.transitivity_avglocal_undirected(mode="zero")
-            print(f"Successfully calculated clustering: {clustering:.4f}")
+            # Parallel clustering coefficient calculation
+            with Pool(n_processes) as pool:
+                # Prepare arguments for each node
+                node_args = [(subgraph, node_idx) for node_idx in range(subgraph.vcount())]
+                
+                # Calculate clustering coefficients in parallel
+                clustering_coeffs = pool.map(self._calculate_node_clustering, node_args)
+                
+                # Calculate average clustering
+                clustering = np.mean([c for c in clustering_coeffs if not np.isnan(c)])
+                print(f"Successfully calculated clustering: {clustering:.4f}")
             
-            # Parallel path length calculation
-            if largest_cc.vcount() > 100:
-                sampled_nodes = random.sample(range(largest_cc.vcount()), 100)
+            # Parallel path length calculation - sample if graph is large
+            if subgraph.vcount() > 100:
+                sampled_nodes = random.sample(range(subgraph.vcount()), 100)
                 node_pairs = list(itertools.combinations(sampled_nodes, 2))
             else:
-                node_pairs = list(itertools.combinations(range(largest_cc.vcount()), 2))
+                node_pairs = list(itertools.combinations(range(subgraph.vcount()), 2))
             
             # Split node pairs into chunks for parallel processing
             chunk_size = max(1, len(node_pairs) // (n_processes * 4))
@@ -332,7 +307,7 @@ class BikePathEnv(gym.Env):
             
             with Pool(n_processes) as pool:
                 # Prepare arguments for each chunk
-                chunk_args = [(largest_cc, chunk) for chunk in chunks]
+                chunk_args = [(subgraph, chunk) for chunk in chunks]
                 
                 # Calculate path lengths in parallel
                 path_lengths_chunks = pool.map(self._calculate_path_lengths_chunk, chunk_args)
@@ -365,7 +340,7 @@ class BikePathEnv(gym.Env):
             return 0.0, 0.0
     
     def _calculate_population_served(self):
-        """Calculate population served with improved metrics."""
+        """Calculate population served with improved metrics using igraph."""
         try:
             if self.graph.vcount() == 0:
                 return 0.0
@@ -377,15 +352,15 @@ class BikePathEnv(gym.Env):
             # Basic coverage ratio
             coverage_ratio = bike_nodes / max(1, all_nodes)
             
-            # Get connected components info
-            components = self.graph.clusters()
+            # Get connected components info - much more efficient in igraph
+            components = self.graph.clusters(mode='weak')
             
-            if len(components) == 0:
+            if not components:
                 return 0.0
                 
-            # Calculate component size ratio - use giant component
-            largest_component_size = max(components.sizes())
-            component_ratio = largest_component_size / max(1, bike_nodes)
+            # Calculate component size ratio 
+            largest_comp_size = max(components.sizes())
+            component_ratio = largest_comp_size / max(1, bike_nodes)
             
             # Combine metrics with weights
             population_score = 0.7 * coverage_ratio + 0.3 * component_ratio
@@ -399,23 +374,11 @@ class BikePathEnv(gym.Env):
     def _get_state(self):
         """Get current state with improved metrics and validation."""
         try:
-            # Set default values in case calculation fails
-            connectivity = 0.0
-            path_efficiency = 0.0
-            pop_served = 0.0
+            # Calculate connectivity metrics
+            connectivity, path_efficiency = self._calculate_connectivity()
             
-            # Safely calculate metrics, catching errors at each step
-            try:
-                # Calculate connectivity metrics
-                connectivity, path_efficiency = self._calculate_connectivity()
-            except Exception as e:
-                print(f"Error calculating connectivity: {e}")
-            
-            try:
-                # Calculate population served
-                pop_served = self._calculate_population_served()
-            except Exception as e:
-                print(f"Error calculating population served: {e}")
+            # Calculate population served
+            pop_served = self._calculate_population_served()
             
             # Calculate normalized budget
             norm_budget = self.budget / self.initial_budget
@@ -440,7 +403,6 @@ class BikePathEnv(gym.Env):
             
         except Exception as e:
             print(f"Error calculating state: {e}")
-            # Return zeros if anything fails
             return np.zeros(4, dtype=np.float32)
     
     def step(self, action):
@@ -454,21 +416,21 @@ class BikePathEnv(gym.Env):
             return self.state, -10, True, False, {}
         
         # Get selected edge
-        u, v, data = self.candidate_edges[action]
+        ig_source, ig_target, osm_source, osm_target, data = self.candidate_edges[action]
         
         # Validate edge cost
         cost = data.get('length', 0) * self.edge_cost_factor
         if cost <= 0:
-            print(f"Warning: Invalid edge cost {cost} for edge ({u}, {v})")
+            print(f"Warning: Invalid edge cost {cost} for edge ({osm_source}, {osm_target})")
             return self.state, -5, False, False, {}
         
         # Check budget
         if cost > self.budget:
-            print(f"Not enough budget for edge ({u}, {v}). Cost: {cost:.1f}, Budget: {self.budget:.1f}")
+            print(f"Not enough budget for edge ({osm_source}, {osm_target}). Cost: {cost:.1f}, Budget: {self.budget:.1f}")
             self.candidate_edges.pop(action)
             
             # Check if we're done
-            min_edge_cost = min([d['length'] * self.edge_cost_factor for _, _, d in self.candidate_edges]) if self.candidate_edges else float('inf')
+            min_edge_cost = min([d['length'] * self.edge_cost_factor for _, _, _, _, d in self.candidate_edges]) if self.candidate_edges else float('inf')
             done = (self.budget < min_edge_cost) or len(self.candidate_edges) == 0
             
             return self.state, -1, done, False, {}
@@ -476,55 +438,57 @@ class BikePathEnv(gym.Env):
         # Update budget
         self.budget -= cost
         
-        # Add edge to graph
-        # Add better error handling for edge existence check
-        try:
-            edge_id = self.graph.get_eid(u, v, directed=False, error=False)
-        except Exception as e:
-            print(f"Error checking if edge exists: {e}")
-            edge_id = -1  # Assume edge doesn't exist
+        # Add edge to graph with proper attribute handling
+        # Need to first make sure nodes exist in our graph
+        source_idx = None 
+        target_idx = None
+        
+        # Check if nodes already exist in current graph
+        if osm_source in self.node_map['osm_to_ig']:
+            source_idx = self.node_map['osm_to_ig'][osm_source]
+        else:
+            # Add the node
+            source_v = self.walk_graph.vs.find(osmid=osm_source)
+            new_idx = self.graph.add_vertex(osmid=osm_source)
+            source_idx = new_idx.index
             
-        if edge_id == -1:  # Edge doesn't exist
-            # Ensure nodes have proper attributes from walk graph
-            for node_idx, attr_src in [(u, self.walk_graph.vs[u]), (v, self.walk_graph.vs[v])]:
-                for attr_name in ['x', 'y']:
-                    if attr_name not in self.graph.vs[node_idx].attributes() or not self.graph.vs[node_idx][attr_name]:
-                        if attr_name in attr_src.attributes() and attr_src[attr_name]:
-                            self.graph.vs[node_idx][attr_name] = attr_src[attr_name]
+            # Copy attributes
+            for attr, value in source_v.attributes().items():
+                self.graph.vs[source_idx][attr] = value
             
-            # Add the edge with attributes
+            # Update mapping
+            self.node_map['osm_to_ig'][osm_source] = source_idx
+            self.node_map['ig_to_osm'][source_idx] = osm_source
+            
+        if osm_target in self.node_map['osm_to_ig']:
+            target_idx = self.node_map['osm_to_ig'][osm_target]
+        else:
+            # Add the node
+            target_v = self.walk_graph.vs.find(osmid=osm_target)
+            new_idx = self.graph.add_vertex(osmid=osm_target)
+            target_idx = new_idx.index
+            
+            # Copy attributes
+            for attr, value in target_v.attributes().items():
+                self.graph.vs[target_idx][attr] = value
+                
+            # Update mapping
+            self.node_map['osm_to_ig'][osm_target] = target_idx
+            self.node_map['ig_to_osm'][target_idx] = osm_target
+        
+        # Now add the edge if it doesn't exist
+        if self.graph.get_eid(source_idx, target_idx, directed=False, error=False) < 0:
+            # Create a copy of data to avoid modifying the original
             edge_data = data.copy()
             edge_data['bike_lane'] = 'yes'  # Mark as bike path
             
-            # Add the edge
-            edge_id = self.graph.add_edge(u, v)
-            
-            # Add attributes to the edge with proper type handling
-            for k, v in edge_data.items():
-                if isinstance(k, str):  # Only string attribute names are supported
-                    try:
-                        # Handle common types that might cause issues
-                        if isinstance(v, list) and len(v) > 0:
-                            # Convert lists to strings to avoid type issues
-                            self.graph.es[edge_id][k] = str(v)
-                        elif v is not None:
-                            self.graph.es[edge_id][k] = v
-                    except TypeError:
-                        print(f"Warning: Could not set edge attribute {k}={v} (type: {type(v)}), converting to string")
-                        try:
-                            self.graph.es[edge_id][k] = str(v)
-                        except:
-                            pass  # Skip if all else fails
+            # Add the edge with all attributes
+            e_idx = self.graph.add_edge(source_idx, target_idx)
+            for attr, value in edge_data.items():
+                self.graph.es[e_idx][attr] = value
                 
-            # Ensure length attribute exists
-            if 'length' not in edge_data or edge_data['length'] <= 0:
-                source_v = self.graph.vs[u]
-                target_v = self.graph.vs[v]
-                u_coords = (source_v['y'], source_v['x'])
-                v_coords = (target_v['y'], target_v['x'])
-                self.graph.es[edge_id]['length'] = ox.distance.great_circle(u_coords, v_coords)
-            
-            self.added_paths.append((u, v, self.graph.es[edge_id]['length']))
+            # Store the added path for visualization
+            self.added_paths.append((osm_source, osm_target, edge_data['length']))
         
         # Calculate new state and reward
         old_state = self.state
@@ -545,7 +509,7 @@ class BikePathEnv(gym.Env):
         
         # Remove used edge and check completion
         self.candidate_edges.pop(action)
-        min_edge_cost = min([d['length'] * self.edge_cost_factor for _, _, d in self.candidate_edges]) if self.candidate_edges else float('inf')
+        min_edge_cost = min([d['length'] * self.edge_cost_factor for _, _, _, _, d in self.candidate_edges]) if self.candidate_edges else float('inf')
         done = (self.budget < min_edge_cost) or len(self.candidate_edges) == 0
         
         # Create detailed info dict
@@ -565,7 +529,7 @@ class BikePathEnv(gym.Env):
         # Log progress
         if self.episode_steps % 10 == 0 or done:
             print(f"\nStep {self.episode_steps}:")
-            print(f"Added path: ({u},{v}), length={data['length']:.1f}m, cost={cost:.1f}")
+            print(f"Added path: ({osm_source},{osm_target}), length={data['length']:.1f}m, cost={cost:.1f}")
             print(f"State: {[f'{x:.4f}' for x in self.state]}")
             print(f"Reward: {reward:.2f}")
             print(f"Budget: {self.budget:.1f}/{self.initial_budget:.1f}")
@@ -598,6 +562,9 @@ class BikePathEnv(gym.Env):
         self.graph = self.original_graph.copy()
         self._validate_graph_attributes()
         
+        # Reset node mapping
+        self.node_map = self._create_node_mapping()
+        
         # Reset other variables
         self.budget = self.initial_budget
         self.candidate_edges = self._get_candidate_edges()
@@ -616,12 +583,12 @@ class BikePathEnv(gym.Env):
         try:
             fig, ax = plt.subplots(figsize=(15, 12))
             
-            # Convert igraph back to NetworkX for plotting with OSMnx
-            G_base = self._convert_igraph_to_networkx(self.original_graph)
+            # For rendering, we need to use the NetworkX graph from OSMnx
+            # because ox.plot_graph expects a NetworkX graph
             
             # Plot base network
-            if len(G_base.edges()) > 0:
-                ox.plot_graph(G_base, ax=ax, node_size=0, 
+            if len(self.nx_original_graph.edges()) > 0:
+                ox.plot_graph(self.nx_original_graph, ax=ax, node_size=0, 
                             edge_color='lightblue', edge_linewidth=1, 
                             edge_alpha=0.7, show=False)
             else:
@@ -677,57 +644,37 @@ class BikePathEnv(gym.Env):
         except Exception as e:
             print(f"Error in render: {e}")
             return None
-    
-    def _convert_igraph_to_networkx(self, ig_graph):
-        """Convert igraph back to NetworkX for visualization."""
-        import networkx as nx
-        
-        # Create empty networkx graph
-        if ig_graph.is_directed():
-            nx_graph = nx.MultiDiGraph()
-        else:
-            nx_graph = nx.MultiGraph()
-        
-        # Add nodes with attributes
-        for v in ig_graph.vs:
-            node_attrs = {k: v[k] for k in v.attributes() if k != 'name'}
-            nx_graph.add_node(v['name'], **node_attrs)
-        
-        # Add edges with attributes
-        for e in ig_graph.es:
-            source_name = ig_graph.vs[e.source]['name']
-            target_name = ig_graph.vs[e.target]['name']
-            edge_attrs = {k: e[k] for k in e.attributes() if k != 'key_attr'}
-            key = int(e.get('key_attr', 0)) if e.get('key_attr') else 0
-            nx_graph.add_edge(source_name, target_name, key=key, **edge_attrs)
-        
-        return nx_graph
         
     def get_edge_gdf(self):
         """Convert added paths to GeoDataFrame with improved error handling."""
         try:
             edges = []
-            for u, v, length in self.added_paths:
+            for osm_u, osm_v, length in self.added_paths:
                 try:
-                    u_data = self.graph.vs[u].attributes()
-                    v_data = self.graph.vs[v].attributes()
-                    
-                    if all(k in u_data for k in ['x', 'y']) and all(k in v_data for k in ['x', 'y']):
-                        geom = LineString([
-                            (u_data['x'], u_data['y']),
-                            (v_data['x'], v_data['y'])
-                        ])
+                    # Find these nodes in graph
+                    if osm_u in self.node_map['osm_to_ig'] and osm_v in self.node_map['osm_to_ig']:
+                        u_idx = self.node_map['osm_to_ig'][osm_u]
+                        v_idx = self.node_map['osm_to_ig'][osm_v]
                         
-                        edges.append({
-                            'geometry': geom,
-                            'length': length,
-                            'start_node': u,
-                            'end_node': v
-                        })
-                    else:
-                        print(f"Warning: Missing coordinates for edge ({u}, {v})")
+                        u_data = self.graph.vs[u_idx].attributes()
+                        v_data = self.graph.vs[v_idx].attributes()
+                        
+                        if all(k in u_data for k in ['x', 'y']) and all(k in v_data for k in ['x', 'y']):
+                            geom = LineString([
+                                (u_data['x'], u_data['y']),
+                                (v_data['x'], v_data['y'])
+                            ])
+                            
+                            edges.append({
+                                'geometry': geom,
+                                'length': length,
+                                'start_node': osm_u,
+                                'end_node': osm_v
+                            })
+                        else:
+                            print(f"Warning: Missing coordinates for edge ({osm_u}, {osm_v})")
                 except Exception as e:
-                    print(f"Error processing edge ({u}, {v}): {e}")
+                    print(f"Error processing edge ({osm_u}, {osm_v}): {e}")
                     continue
             
             if edges:
@@ -740,6 +687,87 @@ class BikePathEnv(gym.Env):
         except Exception as e:
             print(f"Error creating GeoDataFrame: {e}")
             return None
+
+
+class TrainingProgressCallback(BaseCallback):
+    """
+    Custom callback for tracking and displaying training progress.
+    """
+    def __init__(self, verbose=1, log_freq=1000):
+        super(TrainingProgressCallback, self).__init__(verbose)
+        self.log_freq = log_freq
+        self.episode_count = 0
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_connectivity = []
+        self.episode_population = []
+        self.start_time = None
+        
+    def _on_training_start(self):
+        """Called at the start of training"""
+        self.start_time = time.time()
+        print("\nTraining started...")
+        
+    def _on_rollout_start(self):
+        """Called at the start of a rollout"""
+        pass
+        
+    def _on_step(self):
+        """Called at each step"""
+        # Check if an episode has ended
+        dones = self.locals["dones"]
+        infos = self.locals["infos"]
+        
+        for i, done in enumerate(dones):
+            if done:
+                self.episode_count += 1
+                
+                # Try to extract episode metrics from info
+                if "episode" in infos[i]:
+                    ep_info = infos[i]["episode"]
+                    self.episode_rewards.append(ep_info["r"])
+                    self.episode_lengths.append(ep_info["l"])
+                    
+                # Try to extract custom metrics
+                if "connectivity" in infos[i]:
+                    self.episode_connectivity.append(infos[i]["connectivity"])
+                if "population_served" in infos[i]:
+                    self.episode_population.append(infos[i]["population_served"])
+                
+                # Log every few episodes
+                if self.episode_count % 5 == 0:
+                    elapsed_time = time.time() - self.start_time
+                    avg_reward = sum(self.episode_rewards[-5:]) / 5
+                    avg_length = sum(self.episode_lengths[-5:]) / 5
+                    
+                    print(f"\nEpisode {self.episode_count}: avg_reward={avg_reward:.2f}, avg_steps={avg_length:.1f}")
+                    print(f"Progress: {self.num_timesteps}/{self.locals['total_timesteps']} steps " +
+                          f"({self.num_timesteps/self.locals['total_timesteps']*100:.1f}%)")
+                    print(f"Elapsed time: {elapsed_time/60:.2f} minutes")
+        
+        # Log every log_freq steps
+        if self.num_timesteps % self.log_freq == 0:
+            # Calculate average metrics
+            if self.episode_rewards:
+                avg_reward = sum(self.episode_rewards) / len(self.episode_rewards)
+                print(f"\nStep {self.num_timesteps}: Running avg reward = {avg_reward:.2f} over {self.episode_count} episodes")
+            
+        return True
+    
+    def _on_training_end(self):
+        """Called at the end of training"""
+        elapsed_time = time.time() - self.start_time
+        hours, remainder = divmod(elapsed_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        print(f"\nTraining completed after {int(hours)}h {int(minutes)}m {seconds:.2f}s")
+        print(f"Total episodes: {self.episode_count}")
+        
+        if self.episode_rewards:
+            avg_reward = sum(self.episode_rewards) / len(self.episode_rewards)
+            print(f"Average episode reward: {avg_reward:.2f}")
+        
+        print(f"Final timestep: {self.num_timesteps}")
 
 
 def train_rl_model(city_name='Amsterdam, Netherlands', budget=10000, total_timesteps=50000):
@@ -987,88 +1015,6 @@ def evaluate_and_visualize(model, city_name=None, north=None, south=None, east=N
     
     return best_paths, best_state
 
-
-class TrainingProgressCallback(BaseCallback):
-    """
-    Custom callback for tracking and displaying training progress.
-    """
-    def __init__(self, verbose=1, log_freq=1000):
-        super(TrainingProgressCallback, self).__init__(verbose)
-        self.log_freq = log_freq
-        self.episode_count = 0
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_connectivity = []
-        self.episode_population = []
-        self.start_time = None
-        
-    def _on_training_start(self):
-        """Called at the start of training"""
-        self.start_time = time.time()
-        print("\nTraining started...")
-        
-    def _on_rollout_start(self):
-        """Called at the start of a rollout"""
-        pass
-        
-    def _on_step(self):
-        """Called at each step"""
-        # Check if an episode has ended
-        dones = self.locals["dones"]
-        infos = self.locals["infos"]
-        
-        for i, done in enumerate(dones):
-            if done:
-                self.episode_count += 1
-                
-                # Try to extract episode metrics from info
-                if "episode" in infos[i]:
-                    ep_info = infos[i]["episode"]
-                    self.episode_rewards.append(ep_info["r"])
-                    self.episode_lengths.append(ep_info["l"])
-                    
-                # Try to extract custom metrics
-                if "connectivity" in infos[i]:
-                    self.episode_connectivity.append(infos[i]["connectivity"])
-                if "population_served" in infos[i]:
-                    self.episode_population.append(infos[i]["population_served"])
-                
-                # Log every few episodes
-                if self.episode_count % 5 == 0:
-                    elapsed_time = time.time() - self.start_time
-                    avg_reward = sum(self.episode_rewards[-5:]) / 5
-                    avg_length = sum(self.episode_lengths[-5:]) / 5
-                    
-                    print(f"\nEpisode {self.episode_count}: avg_reward={avg_reward:.2f}, avg_steps={avg_length:.1f}")
-                    print(f"Progress: {self.num_timesteps}/{self.locals['total_timesteps']} steps " +
-                          f"({self.num_timesteps/self.locals['total_timesteps']*100:.1f}%)")
-                    print(f"Elapsed time: {elapsed_time/60:.2f} minutes")
-        
-        # Log every log_freq steps
-        if self.num_timesteps % self.log_freq == 0:
-            # Calculate average metrics
-            if self.episode_rewards:
-                avg_reward = sum(self.episode_rewards) / len(self.episode_rewards)
-                print(f"\nStep {self.num_timesteps}: Running avg reward = {avg_reward:.2f} over {self.episode_count} episodes")
-            
-        return True
-    
-    def _on_training_end(self):
-        """Called at the end of training"""
-        elapsed_time = time.time() - self.start_time
-        hours, remainder = divmod(elapsed_time, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        print(f"\nTraining completed after {int(hours)}h {int(minutes)}m {seconds:.2f}s")
-        print(f"Total episodes: {self.episode_count}")
-        
-        if self.episode_rewards:
-            avg_reward = sum(self.episode_rewards) / len(self.episode_rewards)
-            print(f"Average episode reward: {avg_reward:.2f}")
-        
-        print(f"Final timestep: {self.num_timesteps}")
-
-
 def main():
     """Main function to demonstrate the bike path RL model."""
     import argparse
@@ -1096,7 +1042,7 @@ def main():
     
     # Print header
     print("\n" + "="*70)
-    print(f"BIKE PATH REINFORCEMENT LEARNING MODEL")
+    print(f"BIKE PATH REINFORCEMENT LEARNING MODEL (igraph version)")
     print("="*70)
     print(f"City: {args.city}")
     print(f"Budget: {args.budget}")
