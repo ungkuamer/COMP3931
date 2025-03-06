@@ -197,9 +197,12 @@ class BikePathEnv(gym.Env):
         result = cp.zeros(n, dtype=cp.float32)
         
         # Configure CUDA grid
-        threads_per_block = 256
-        blocks_per_grid = (n + threads_per_block - 1) // threads_per_block
+        threads_per_block = 512
+        min_blocks = 32
+        blocks_per_grid = max(min_blocks, (n + threads_per_block - 1) // threads_per_block)
         
+        print(f"CUDA grid configuration: {blocks_per_grid} blocks with {threads_per_block} threads each")
+
         # Launch kernel - using the global function instead of the method
         clustering_kernel[blocks_per_grid, threads_per_block](adj_gpu, result)
         
