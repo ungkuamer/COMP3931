@@ -153,7 +153,7 @@ class BikePathEnv(gym.Env):
                 print(f"Error calculating clustering for node {node}: {e}")
                 results.append(0.0)
                 
-        return results        
+        return results       
     
     def _calculate_path_lengths_chunk(self, args):
         """Calculate path lengths for a chunk of node pairs with progress tracking."""
@@ -277,6 +277,10 @@ class BikePathEnv(gym.Env):
             subgraph = simple_graph.subgraph(largest_cc).copy()
             print(f"Using connected component with {len(subgraph.nodes())} nodes and {len(subgraph.edges())} edges")
             
+            # Number of processes to use (leave one core free) - define this before any code path that might use it
+            n_processes = max(1, cpu_count() - 1)
+            print(f"Using {n_processes} processes for parallel computation")
+            
             # ---- OPTIMIZATION 1: Use NetworkX's built-in clustering functions when possible ----
             # Determine if we can use NetworkX's optimized implementation
             print("Starting clustering coefficient calculation...")
@@ -305,9 +309,7 @@ class BikePathEnv(gym.Env):
                 print("Falling back to custom parallel implementation")
                 
                 # ---- OPTIMIZATION 2: Improved parallel implementation with batching ----
-                # Number of processes to use (leave one core free)
-                n_processes = max(1, cpu_count() - 1)
-                print(f"Using {n_processes} processes for parallel computation")
+                # n_processes is already defined above
                 
                 # ---- OPTIMIZATION 3: Batch processing to reduce overhead ----
                 # Group nodes into batches to reduce parallelization overhead
