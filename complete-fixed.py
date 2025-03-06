@@ -913,13 +913,13 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train and evaluate a RL model for bike path planning')
-    parser.add_argument('--city', type=str, default='Amsterdam, Netherlands', 
+    parser.add_argument('--city', type=str, default='Colmar, France', 
                         help='City name to analyze (default: Amsterdam, Netherlands)')
-    parser.add_argument('--budget', type=float, default=10000, 
+    parser.add_argument('--budget', type=float, default=150000, 
                         help='Budget for bike path construction (default: 10000)')
-    parser.add_argument('--timesteps', type=int, default=10000, 
+    parser.add_argument('--timesteps', type=int, default=5000, 
                         help='Training timesteps (default: 10000)')
-    parser.add_argument('--eval_episodes', type=int, default=5, 
+    parser.add_argument('--eval_episodes', type=int, default=3, 
                         help='Number of evaluation episodes (default: 5)')
     parser.add_argument('--skip_training', action='store_true', 
                         help='Skip training and load existing model')
