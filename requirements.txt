@@ -9,3 +9,4 @@ gym
 tqdm
 stable-baselines3
 shimmy
+igraph
