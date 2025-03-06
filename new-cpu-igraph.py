@@ -471,17 +471,17 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Bike Path Planning with Reinforcement Learning")
     
     # City configuration
-    parser.add_argument("--city", type=str, default="Amsterdam, Netherlands",
-                        help="City name for analysis (e.g., 'Boston, USA')")
+    parser.add_argument("--city", type=str, default="Colmar, France",
+                        help="City name for analysis (e.g., 'Colmar, France')")
     
     # Training parameters
-    parser.add_argument("--timesteps", type=int, default=50000,
+    parser.add_argument("--timesteps", type=int, default=5000,
                         help="Total timesteps for training")
-    parser.add_argument("--eval_episodes", type=int, default=10,
+    parser.add_argument("--eval_episodes", type=int, default=3,
                         help="Number of episodes for evaluation")
     
     # Environment parameters
-    parser.add_argument("--budget", type=int, default=20,
+    parser.add_argument("--budget", type=int, default=150,
                         help="Budget (number of bike paths to add)")
     
     # Reward weights
@@ -495,7 +495,7 @@ def parse_arguments():
     # Save options
     parser.add_argument("--model_dir", type=str, default="./models",
                         help="Directory to save trained models")
-    parser.add_argument("--save_freq", type=int, default=10000,
+    parser.add_argument("--save_freq", type=int, default=1000,
                         help="Frequency of saving model checkpoints (in timesteps)")
     
     # Visualization options
