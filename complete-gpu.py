@@ -23,6 +23,34 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 
+@cuda.jit
+def clustering_kernel(adj_matrix, result):
+    """CUDA kernel for clustering coefficient calculation."""
+    i = cuda.grid(1)
+    if i < adj_matrix.shape[0]:
+        neighbors = 0
+        triangles = 0
+        n = adj_matrix.shape[0]
+        
+        # Count neighbors
+        for j in range(n):
+            if adj_matrix[i, j] > 0:
+                neighbors += 1
+                
+        # Count triangles
+        for j in range(n):
+            if adj_matrix[i, j] > 0:
+                for k in range(j + 1, n):
+                    if adj_matrix[i, k] > 0 and adj_matrix[j, k] > 0:
+                        triangles += 1
+                        
+        # Calculate local clustering coefficient
+        if neighbors > 1:
+            possible_triangles = neighbors * (neighbors - 1) / 2
+            result[i] = triangles / possible_triangles
+        else:
+            result[i] = 0
+
 class BikePathEnv(gym.Env):
     """
     Custom Environment for optimizing bike path additions to a city network.
@@ -162,34 +190,6 @@ class BikePathEnv(gym.Env):
             print(f"GPU computation failed: {e}")
             print("Falling back to CPU implementation...")
             return self._calculate_connectivity(self)
-        
-    @cuda.jit
-    def _clustering_kernel(adj_matrix, result):
-        """CUDA kernel for clustering coefficient calculation."""
-        i = cuda.grid(1)
-        if i < adj_matrix.shape[0]:
-            neighbors = 0
-            triangles = 0
-            n = adj_matrix.shape[0]
-            
-            # Count neighbors
-            for j in range(n):
-                if adj_matrix[i, j] > 0:
-                    neighbors += 1
-                    
-            # Count triangles
-            for j in range(n):
-                if adj_matrix[i, j] > 0:
-                    for k in range(j + 1, n):
-                        if adj_matrix[i, k] > 0 and adj_matrix[j, k] > 0:
-                            triangles += 1
-                            
-            # Calculate local clustering coefficient
-            if neighbors > 1:
-                possible_triangles = neighbors * (neighbors - 1) / 2
-                result[i] = triangles / possible_triangles
-            else:
-                result[i] = 0
 
     def _calculate_clustering_gpu(self, adj_gpu):
         """Calculate clustering coefficient using GPU."""
@@ -200,8 +200,8 @@ class BikePathEnv(gym.Env):
         threads_per_block = 256
         blocks_per_grid = (n + threads_per_block - 1) // threads_per_block
         
-        # Launch kernel
-        self._clustering_kernel[blocks_per_grid, threads_per_block](adj_gpu, result)
+        # Launch kernel - using the global function instead of the method
+        clustering_kernel[blocks_per_grid, threads_per_block](adj_gpu, result)
         
         # Average the results
         return float(cp.mean(result))
