@@ -124,22 +124,81 @@ class BikePathEnv(gym.Env):
             except Exception as e:
                 print(f"Error calculating clustering for node {node}: {e}")
                 return 0.0  # Return 0 if there's an error
+
+    def _calculate_node_clustering_batch(self, args):
+        """Calculate clustering coefficients for a batch of nodes.
+        This batched approach reduces the overhead of parallel processing."""
+        G, nodes = args
+        results = []
         
+        # Process each node in the batch
+        for node in nodes:
+            try:
+                neighbors = list(G.neighbors(node))
+                if len(neighbors) < 2:
+                    results.append(0.0)
+                    continue
+                    
+                # ---- OPTIMIZATION: Use dict for edge lookup ----
+                # Pre-compute edge existence for faster lookup
+                edge_exists = {}
+                for i, j in itertools.combinations(neighbors, 2):
+                    edge_exists[(i, j)] = G.has_edge(i, j)
+                
+                triangles = sum(1 for i, j in itertools.combinations(neighbors, 2) if edge_exists.get((i, j)) or edge_exists.get((j, i)))
+                possible = len(neighbors) * (len(neighbors) - 1) / 2
+                
+                results.append(triangles / possible if possible > 0 else 0.0)
+            except Exception as e:
+                print(f"Error calculating clustering for node {node}: {e}")
+                results.append(0.0)
+                
+        return results        
+    
     def _calculate_path_lengths_chunk(self, args):
         """Calculate path lengths for a chunk of node pairs with progress tracking."""
         G, node_pairs = args
         lengths = []
         
-        # Track chunk progress internally - useful for larger chunks
-        total_pairs = len(node_pairs)
-        for idx, (u, v) in enumerate(node_pairs):
+        # ---- OPTIMIZATION: Use all_pairs_shortest_path_length when appropriate ----
+        if len(node_pairs) > 50:
+            # For large chunks, use NetworkX's optimized algorithm
             try:
-                length = nx.shortest_path_length(G, u, v, weight='length')
-                if length > 0:
-                    lengths.append(length)
+                # Get unique nodes in this chunk
+                unique_nodes = set()
+                for u, v in node_pairs:
+                    unique_nodes.add(u)
+                    unique_nodes.add(v)
+                    
+                # Calculate all pairs for these nodes
+                length_dict = dict(nx.all_pairs_shortest_path_length(G, weight='length'))
+                
+                # Extract the ones we need
+                for u, v in node_pairs:
+                    try:
+                        length = length_dict[u][v]
+                        if length > 0:
+                            lengths.append(length)
+                    except KeyError:
+                        pass
             except Exception:
-                print("Error calculating path length for nodes ({u}, {v})")
-                continue
+                # Fall back to individual calculations if the all-pairs approach fails
+                for u, v in node_pairs:
+                    try:
+                        length = nx.shortest_path_length(G, u, v, weight='length')
+                        if length > 0:
+                            lengths.append(length)
+                    except Exception:
+                        continue
+        else:
+            # For small chunks, just calculate individual paths
+            for u, v in node_pairs:
+                try:
+                    length = nx.shortest_path_length(G, u, v, weight='length')
+                    if length > 0:
+                        lengths.append(length)
+                except Exception:
+                    continue
         
         return lengths
                
@@ -194,7 +253,7 @@ class BikePathEnv(gym.Env):
             return candidates
     
     def _calculate_connectivity(self):
-        """Calculate connectivity metrics using parallel processing with progress tracking."""
+        """Calculate connectivity metrics using parallel processing with optimized clustering calculation."""
         try:
             # Verify graph has nodes and edges
             if len(self.graph.nodes()) == 0 or len(self.graph.edges()) == 0:
@@ -218,41 +277,88 @@ class BikePathEnv(gym.Env):
             subgraph = simple_graph.subgraph(largest_cc).copy()
             print(f"Using connected component with {len(subgraph.nodes())} nodes and {len(subgraph.edges())} edges")
             
-            # Number of processes to use (leave one core free)
-            n_processes = max(1, cpu_count() - 1)
-            print(f"Using {n_processes} processes for parallel computation")
-            
-            # Parallel clustering coefficient calculation
+            # ---- OPTIMIZATION 1: Use NetworkX's built-in clustering functions when possible ----
+            # Determine if we can use NetworkX's optimized implementation
             print("Starting clustering coefficient calculation...")
-            with Pool(n_processes) as pool:
-                # Prepare arguments for each node
-                node_args = [(subgraph, node) for node in subgraph.nodes()]
-                total_nodes = len(node_args)
+            try:
+                # Try using NetworkX's optimized implementation first
+                start_time = time.time()
                 
-                # Calculate clustering coefficients in parallel with progress tracking
-                clustering_coeffs = []
-                for i, result in enumerate(tqdm(pool.imap(self._calculate_node_clustering, node_args), 
-                                            total=total_nodes, 
-                                            desc="Calculating clustering coefficients")):
-                    clustering_coeffs.append(result)
-                    # Print progress every 10%
-                    if total_nodes > 100 and i % (total_nodes // 10) == 0 and i > 0:
-                        print(f"Clustering progress: {i}/{total_nodes} nodes processed ({i/total_nodes*100:.1f}%)")
-                
-                # Calculate average clustering
+                # Sample nodes for very large graphs to speed up computation
+                if len(subgraph) > 500:
+                    print(f"Graph is large ({len(subgraph)} nodes). Sampling 500 nodes for clustering calculation.")
+                    sampled_nodes = random.sample(list(subgraph.nodes()), 500)
+                    clustering_dict = nx.clustering(subgraph, nodes=sampled_nodes)
+                else:
+                    print(f"Computing clustering for all {len(subgraph)} nodes")
+                    clustering_dict = nx.clustering(subgraph)
+                    
+                clustering_coeffs = list(clustering_dict.values())
                 clustering = np.mean(clustering_coeffs)
-                print(f"Successfully calculated clustering: {clustering:.4f}")
+                
+                end_time = time.time()
+                print(f"Successfully calculated clustering using NetworkX implementation: {clustering:.4f}")
+                print(f"Clustering calculation time: {end_time - start_time:.2f} seconds")
+                
+            except Exception as e:
+                print(f"NetworkX clustering implementation failed: {e}")
+                print("Falling back to custom parallel implementation")
+                
+                # ---- OPTIMIZATION 2: Improved parallel implementation with batching ----
+                # Number of processes to use (leave one core free)
+                n_processes = max(1, cpu_count() - 1)
+                print(f"Using {n_processes} processes for parallel computation")
+                
+                # ---- OPTIMIZATION 3: Batch processing to reduce overhead ----
+                # Group nodes into batches to reduce parallelization overhead
+                all_nodes = list(subgraph.nodes())
+                batch_size = max(1, len(all_nodes) // (n_processes * 4))
+                node_batches = [all_nodes[i:i + batch_size] for i in range(0, len(all_nodes), batch_size)]
+                print(f"Split into {len(node_batches)} batches of approximately {batch_size} nodes each")
+                
+                with Pool(n_processes) as pool:
+                    # Use batched clustering calculation
+                    batch_args = [(subgraph, batch) for batch in node_batches]
+                    
+                    # Calculate clustering coefficients in parallel with progress tracking
+                    batch_results = []
+                    for i, result in enumerate(tqdm(pool.imap(self._calculate_node_clustering_batch, batch_args), 
+                                                total=len(node_batches), 
+                                                desc="Calculating clustering coefficients")):
+                        batch_results.append(result)
+                    
+                    # Flatten results
+                    clustering_coeffs = list(itertools.chain.from_iterable(batch_results))
+                    
+                    # Calculate average clustering
+                    clustering = np.mean(clustering_coeffs)
+                    print(f"Successfully calculated clustering: {clustering:.4f}")
             
             # Parallel path length calculation
             print("\nStarting path length calculation...")
-            if len(subgraph) > 100:
-                print(f"Sampling 100 nodes from {len(subgraph)} total nodes")
-                sampled_nodes = random.sample(list(subgraph.nodes()), 100)
+            
+            # ---- OPTIMIZATION 4: Sample more intelligently based on graph size ----
+            # Adjust sampling based on graph size
+            sample_size = min(100, len(subgraph))
+            if len(subgraph) > 1000:
+                sample_size = 100
+            elif len(subgraph) > 500:
+                sample_size = min(200, len(subgraph))
+                
+            if sample_size < len(subgraph):
+                print(f"Sampling {sample_size} nodes from {len(subgraph)} total nodes for path calculations")
+                sampled_nodes = random.sample(list(subgraph.nodes()), sample_size)
                 node_pairs = list(itertools.combinations(sampled_nodes, 2))
             else:
                 print(f"Using all {len(subgraph)} nodes for path length calculation")
                 node_pairs = list(itertools.combinations(subgraph.nodes(), 2))
             
+            # ---- OPTIMIZATION 5: Limit the number of pairs to a reasonable maximum ----
+            max_pairs = 10000
+            if len(node_pairs) > max_pairs:
+                print(f"Limiting path calculations to {max_pairs} random pairs (from {len(node_pairs)} total)")
+                node_pairs = random.sample(node_pairs, max_pairs)
+                
             print(f"Total node pairs to process: {len(node_pairs)}")
             
             # Split node pairs into chunks for parallel processing
@@ -271,9 +377,6 @@ class BikePathEnv(gym.Env):
                                             total=len(chunks), 
                                             desc="Calculating path lengths")):
                     path_lengths_chunks.append(result)
-                    # Print progress every 10%
-                    if len(chunks) > 10 and i % (len(chunks) // 10) == 0 and i > 0:
-                        print(f"Path length progress: {i}/{len(chunks)} chunks processed ({i/len(chunks)*100:.1f}%)")
                 
                 # Combine results
                 path_lengths = list(itertools.chain.from_iterable(path_lengths_chunks))
@@ -300,6 +403,8 @@ class BikePathEnv(gym.Env):
             
         except Exception as e:
             print(f"Connectivity calculation failed: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0, 0.0
     
 
