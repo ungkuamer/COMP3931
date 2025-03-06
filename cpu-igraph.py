@@ -241,49 +241,49 @@ class BikePathEnv(gym.Env):
                 target_name = self.walk_graph.vs[e.target]['name']
                 
                 if (source_name, target_name) not in bike_edges and (target_name, source_name) not in bike_edges:
-            data = {}
-            # Safely get edge attributes
-            try:
-                data = e.attributes()
-            except Exception as e_attr:
-                print(f"Error getting edge attributes: {e_attr}")
-                # Create minimal attributes if getting all fails
-                data = {}
-                for attr_name in ['length', 'highway']:
-                    try:
-                        if attr_name in e.attribute_names():
-                            data[attr_name] = e[attr_name]
-                    except:
-                        pass
-                    
-                    # Validate road type
-                    road_type = data.get('highway', '')
-                    if isinstance(road_type, list):
-                        road_type = road_type[0] if road_type else ''
-                    
-                    suitable_types = {'residential', 'tertiary', 'secondary', 'primary', 
-                                    'unclassified', 'living_street'}
-                    
-                    if road_type in suitable_types:
-                        # Validate node coordinates
-                        source_v = self.walk_graph.vs[e.source]
-                        target_v = self.walk_graph.vs[e.target]
+                    data = {}
+                # Safely get edge attributes
+                try:
+                    data = e.attributes()
+                except Exception as e_attr:
+                    print(f"Error getting edge attributes: {e_attr}")
+                    # Create minimal attributes if getting all fails
+                    data = {}
+                    for attr_name in ['length', 'highway']:
+                        try:
+                            if attr_name in e.attribute_names():
+                                data[attr_name] = e[attr_name]
+                        except:
+                            pass
                         
-                        u_coords = (source_v.get('y'), source_v.get('x'))
-                        v_coords = (target_v.get('y'), target_v.get('x'))
+                        # Validate road type
+                        road_type = data.get('highway', '')
+                        if isinstance(road_type, list):
+                            road_type = road_type[0] if road_type else ''
                         
-                        if all(u_coords) and all(v_coords):
-                            # Calculate or validate length
-                            if 'length' not in data:
-                                data['length'] = ox.distance.great_circle(u_coords, v_coords)
+                        suitable_types = {'residential', 'tertiary', 'secondary', 'primary', 
+                                        'unclassified', 'living_street'}
+                        
+                        if road_type in suitable_types:
+                            # Validate node coordinates
+                            source_v = self.walk_graph.vs[e.source]
+                            target_v = self.walk_graph.vs[e.target]
                             
-                            # Additional validation
-                            if data['length'] > 0 and data['length'] < 500:  # Max 500m segments
-                                candidates.append((e.source, e.target, data))
-                        else:
-                            validation_errors += 1
-                            if validation_errors < 10:  # Limit error messages
-                                print(f"Warning: Missing coordinates for edge ({e.source}, {e.target})")
+                            u_coords = (source_v.get('y'), source_v.get('x'))
+                            v_coords = (target_v.get('y'), target_v.get('x'))
+                            
+                            if all(u_coords) and all(v_coords):
+                                # Calculate or validate length
+                                if 'length' not in data:
+                                    data['length'] = ox.distance.great_circle(u_coords, v_coords)
+                                
+                                # Additional validation
+                                if data['length'] > 0 and data['length'] < 500:  # Max 500m segments
+                                    candidates.append((e.source, e.target, data))
+                            else:
+                                validation_errors += 1
+                                if validation_errors < 10:  # Limit error messages
+                                    print(f"Warning: Missing coordinates for edge ({e.source}, {e.target})")
             except Exception as e:
                 validation_errors += 1
                 if validation_errors < 10:
