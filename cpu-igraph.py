@@ -282,8 +282,8 @@ class BikePathEnv(gym.Env):
         lengths = []
         for u, v in node_pairs:
             try:
-                # igraph's shortest paths returns distance matrix
-                length = G.shortest_paths(source=u, target=v, weights='length')[0][0]
+                # Use distances instead of shortest_paths (newer API)
+                length = G.distances(source=u, target=v, weights='length')[0][0]
                 if length > 0 and not np.isinf(length):
                     lengths.append(length)
             except Exception as e:
@@ -442,7 +442,7 @@ class BikePathEnv(gym.Env):
             
             try:
                 # Get largest connected component - much more efficient in igraph
-                components = self.graph.clusters(mode='weak')
+                components = self.graph.connected_components(mode='weak')
                 if not components or len(components) == 0 or max(components.sizes()) == 0:
                     print("Warning: No valid connected components found")
                     return 0.1, 0.1  # Return minimal connectivity values
@@ -573,7 +573,7 @@ class BikePathEnv(gym.Env):
             
             try:
                 # Get connected components info - much more efficient in igraph
-                components = self.graph.clusters(mode='weak')
+                components = self.graph.connected_components(mode='weak')
                 
                 if not components or components.sizes() == []:
                     print("Warning: No valid connected components found in population calculation")
