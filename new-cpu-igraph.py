@@ -555,7 +555,8 @@ def main():
                 learning_rate=0.0003,
                 gamma=0.99,
                 n_steps=2048,
-                ent_coef=0.01)
+                ent_coef=0.01,
+                device="cpu")
     
     # 4. Train model
     print(f"Starting training for {args.timesteps} timesteps...")
