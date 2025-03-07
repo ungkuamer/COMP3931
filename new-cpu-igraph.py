@@ -169,7 +169,7 @@ class BikePathEnvironment(gym.Env):
         done = self.remaining_budget <= 0
         
         # Return state, reward, done, and info
-        return self.state, reward, done, {
+        return self.state, reward, done, False, {
             "action": action,
             "source_node": source_node,
             "target_node": target_node,
@@ -200,8 +200,12 @@ class BikePathEnvironment(gym.Env):
         
         return reward
     
-    def reset(self):
+    def reset(self, seed=None, options=None):
         """Reset environment to initial state"""
+        # Set seed if provided
+        if seed is not None:
+            np.random.seed(seed)
+            
         # Reset graph to original state
         self.G_ig = self.original_G_ig.copy()
         
@@ -215,6 +219,7 @@ class BikePathEnvironment(gym.Env):
         # Reset state
         self.state = self._get_state()
         
+        # Return just the state in new Gymnasium API
         return self.state
     
     def render(self, mode='human', filename=None):
