@@ -453,23 +453,31 @@ def create_interactive_map(env, filename):
 
 class ProgressCallback(BaseCallback):
     """
-    Custom callback for tracking training progress
+    Custom callback for tracking training progress with clearer boundaries and more accurate counting
     """
     def __init__(self, verbose=0):
         super(ProgressCallback, self).__init__(verbose)
         self.progress_bar = None
+        self.prev_timesteps = 0
         
     def _on_training_start(self):
+        print("\n===== STARTING MODEL TRAINING =====")
         self.progress_bar = tqdm(total=self.locals.get('total_timesteps'), 
                                 desc="Training Progress", 
                                 unit="steps")
         
     def _on_step(self):
-        self.progress_bar.update(1)
+        # Get the current timesteps
+        current_timesteps = self.num_timesteps
+        # Only update by the difference to avoid double counting
+        step_diff = current_timesteps - self.prev_timesteps
+        self.progress_bar.update(step_diff)
+        self.prev_timesteps = current_timesteps
         return True
         
     def _on_training_end(self):
         self.progress_bar.close()
+        print("===== MODEL TRAINING COMPLETE =====\n")
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -556,7 +564,7 @@ def main():
     
     # 3. Set up RL model (PPO)
     print("Initializing PPO model...")
-    model = PPO("MlpPolicy", env, verbose=1, 
+    model = PPO("MlpPolicy", env, verbose=0,  # Set verbose to 0 to avoid extra logs during training
                 learning_rate=0.0003,
                 gamma=0.99,
                 n_steps=2048,
@@ -581,24 +589,32 @@ def main():
     print(f"Mean reward: {mean_reward:.2f}")
     
     # 6. Generate bike path recommendations using trained model
-    print("Generating bike path recommendations...")
-    obs = env.reset()
+    print("\n===== GENERATING BIKE PATH RECOMMENDATIONS WITH TRAINED MODEL =====")
+    obs, _ = env.reset()  # Note: use tuple unpacking for new gymnasium API
     done = False
     total_reward = 0
     actions_taken = []
+    valid_actions_count = 0
+    
     
     # Step through environment using trained policy with progress tracking
     with tqdm(total=args.budget, desc="Adding bike paths") as pbar:
         while not done:
             action, _ = model.predict(obs, deterministic=True)
+            prev_obs = obs
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_reward += reward
             actions_taken.append(action)
-            pbar.update(1)
-            pbar.set_postfix({"reward": f"{reward:.2f}"})
+            
+            # Only update progress bar for valid actions
+            if not info.get('invalid_action', False):
+                valid_actions_count += 1
+                pbar.update(1)
+                pbar.set_postfix({"reward": f"{reward:.2f}", "valid_actions": valid_actions_count})
     
     print(f"Total reward: {total_reward:.2f}")
+    print("===== BIKE PATH RECOMMENDATION COMPLETE =====\n")
     
     # 7. Render final result and save visualizations
     map_path = os.path.join(output_dir, "bike_network_map.png")
@@ -623,21 +639,31 @@ def main():
     metrics = evaluate_bike_network(env)
     
     # 9. Compare with random baseline
-    print("\nComparing with random baseline...")
+    print("\n===== COMPARING WITH RANDOM BASELINE =====")
     random_env = BikePathEnvironment(G, budget=args.budget, reward_weights=reward_weights)
     
     # Random actions with progress tracking
-    obs = random_env.reset()
+    obs, _ = random_env.reset()  # Note: use tuple unpacking for new gymnasium API
     done = False
+    random_valid_actions = 0
+    
     with tqdm(total=args.budget, desc="Random baseline") as pbar:
         while not done:
             action = random_env.action_space.sample()
             # Skip if invalid action (already has bike path)
             while random_env.bike_paths[action]:
                 action = random_env.action_space.sample()
+            
             obs, reward, terminated, truncated, info = random_env.step(action)
             done = terminated or truncated
-            pbar.update(1)
+            
+            # Only update progress for valid actions
+            if not info.get('invalid_action', False):
+                random_valid_actions += 1
+                pbar.update(1)
+                pbar.set_postfix({"valid_actions": random_valid_actions})
+    
+    print("===== RANDOM BASELINE COMPLETE =====\n")
     
     # Save random baseline visualization
     random_map_path = os.path.join(output_dir, "random_baseline_map.png")
