@@ -219,8 +219,8 @@ class BikePathEnvironment(gym.Env):
         # Reset state
         self.state = self._get_state()
         
-        # Return just the state in new Gymnasium API
-        return self.state
+        # Return state and info dictionary in the new Gymnasium API format
+        return self.state, {}
     
     def render(self, mode='human', filename=None):
         """Render the environment
