@@ -126,23 +126,23 @@ class BikePathEnvironment(gym.Env):
     
     def step(self, action):
         """
-        Take action to add a bike path and return next state, reward, done, info
+        Take action to add a bike path and return next state, reward, terminated, truncated, info
         Action: index of edge to add bike path
         
         Returns:
-            tuple: (next_state, reward, done, info)
+            tuple: (next_state, reward, terminated, truncated, info)
         """
         # Ensure action is within bounds
         action = int(action)  # Convert to int if it's a numpy int
         if action < 0 or action >= self.G_ig.ecount():
             reward = -1.0  # Penalty for invalid action
-            return self.state, reward, False, {"invalid_action": True, "message": "Action out of bounds"}
+            return self.state, reward, False, False, {"invalid_action": True, "message": "Action out of bounds"}
             
         # Check if action is valid (edge doesn't already have a bike path)
         if self.bike_paths[action]:
             # Invalid action - edge already has a bike path
             reward = -1.0  # Penalty for invalid action
-            return self.state, reward, False, {"invalid_action": True, "message": "Edge already has a bike path"}
+            return self.state, reward, False, False, {"invalid_action": True, "message": "Edge already has a bike path"}
         
         # Add bike path to selected edge
         self.bike_paths[action] = True
@@ -168,7 +168,7 @@ class BikePathEnvironment(gym.Env):
         # Check if episode is done (budget exhausted)
         done = self.remaining_budget <= 0
         
-        # Return state, reward, done, and info
+        # Return state, reward, terminated, truncated, and info
         return self.state, reward, done, False, {
             "action": action,
             "source_node": source_node,
@@ -591,7 +591,8 @@ def main():
     with tqdm(total=args.budget, desc="Adding bike paths") as pbar:
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, _ = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
             total_reward += reward
             actions_taken.append(action)
             pbar.update(1)
@@ -634,7 +635,8 @@ def main():
             # Skip if invalid action (already has bike path)
             while random_env.bike_paths[action]:
                 action = random_env.action_space.sample()
-            obs, reward, done, _ = random_env.step(action)
+            obs, reward, terminated, truncated, info = random_env.step(action)
+            done = terminated or truncated
             pbar.update(1)
     
     # Save random baseline visualization
@@ -723,7 +725,7 @@ def main():
         f.write("done = False\n")
         f.write("while not done:\n")
         f.write("    action, _ = model.predict(obs, deterministic=True)\n")
-        f.write("    obs, reward, done, _ = env.step(action)\n\n")
+        f.write("    obs, reward, terminated, truncated, info = env.step(action)\n\n")
         f.write("# Visualize results\n")
         f.write("env.render()\n")
         f.write("```\n")
