@@ -10,3 +10,6 @@ tqdm
 stable-baselines3
 shimmy
 igraph
+joblib
+rustworkx
+tensorboard
