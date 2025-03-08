@@ -781,7 +781,7 @@ class EvaluationTracker:
         if self.pbar:
             self.pbar.close()
 
-def train_rl_model(city_name='Amsterdam, Netherlands', budget=10000, total_timesteps=50000):
+def train_rl_model(city_name='Amsterdam, Netherlands', budget=10000, total_timesteps=50000, device='cpu'):
     """Train RL model with minimal output."""
     env = BikePathEnv(city_name=city_name, budget=budget)
     env = DummyVecEnv([lambda: env])
@@ -797,7 +797,7 @@ def train_rl_model(city_name='Amsterdam, Netherlands', budget=10000, total_times
         gae_lambda=0.95,
         clip_range=0.2,
         verbose=0,
-        device='auto'
+        device=device
     )
     
     # Setup callbacks
@@ -897,6 +897,8 @@ def main():
                         help='Skip training and load existing model')
     parser.add_argument('--model_path', type=str, default=None, 
                         help='Path to existing model (for --skip_training)')
+    parser.add_argument('--device', type=str, default='cpu', 
+                        help='Training device (default: cpu)')
     
     args = parser.parse_args()
     
@@ -916,7 +918,7 @@ def main():
         print(f"Loading existing model from {args.model_path}...")
         model = PPO.load(args.model_path)
     else:
-        model = train_rl_model(city_name=args.city, budget=args.budget, total_timesteps=args.timesteps)
+        model = train_rl_model(city_name=args.city, budget=args.budget, total_timesteps=args.timesteps, device=args.device)
     
     best_paths, best_state = evaluate_and_visualize(
         model, 
