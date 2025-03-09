@@ -10,13 +10,14 @@ from gymnasium import spaces
 import random
 import time
 import os
+import math
 import itertools
+import multiprocessing
 from datetime import datetime, timedelta
 from tqdm import tqdm
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 
 # Utility functions for NetworkX to rustworkx conversion
@@ -656,7 +657,8 @@ class BikePathEnv(gym.Env):
 
 class TrainingProgressCallback(BaseCallback):
     """
-    Minimal progress callback showing only a progress bar during training.
+    Progress callback showing a progress bar during training,
+    accounting for multiple parallel environments.
     """
     def __init__(self, total_timesteps):
         super(TrainingProgressCallback, self).__init__(verbose=0)
@@ -664,6 +666,7 @@ class TrainingProgressCallback(BaseCallback):
         self.pbar = None
         self.training_start = None
         self.episode_rewards = []
+        self.last_timesteps = 0
         
     def _on_training_start(self):
         self.training_start = time.time()
@@ -671,14 +674,24 @@ class TrainingProgressCallback(BaseCallback):
         
     def _on_step(self):
         if self.pbar:
-            steps_done = self.num_timesteps - self.pbar.n
+            # Get the actual number of environments used
+            n_envs = self.model.get_env().num_envs
+            
+            # Calculate steps done since last update (taking into account parallel envs)
+            steps_done = self.num_timesteps - self.last_timesteps
+            self.last_timesteps = self.num_timesteps
+            
+            # Update progress bar
             self.pbar.update(steps_done)
             
-            if "episode" in self.locals["infos"][0]:
+            # Update reward description if available
+            if len(self.locals["infos"]) > 0 and "episode" in self.locals["infos"][0]:
                 reward = self.locals["infos"][0]["episode"]["r"]
                 self.episode_rewards.append(reward)
                 avg_reward = np.mean(self.episode_rewards[-100:])
-                self.pbar.set_description(f"Training (reward: {avg_reward:.2f})")
+                self.pbar.set_description(
+                    f"Training ({n_envs} envs) | Avg reward: {avg_reward:.2f}"
+                )
         
         return True
     
@@ -781,10 +794,24 @@ class EvaluationTracker:
         if self.pbar:
             self.pbar.close()
 
-def train_rl_model(city_name='Amsterdam, Netherlands', budget=10000, total_timesteps=50000, device='cpu'):
-    """Train RL model with minimal output."""
-    env = BikePathEnv(city_name=city_name, budget=budget)
-    env = DummyVecEnv([lambda: env])
+def make_env(city_name, budget, rank):
+    """
+    Function that creates an environment with a specific seed for process isolation
+    """
+    def _init():
+        env = BikePathEnv(city_name=city_name, budget=budget)
+        env.reset(seed=rank)  # Different seed for each environment
+        return env
+    return _init
+
+def train_rl_model(city_name, budget, total_timesteps, device, n_envs):
+    """Train RL model with parallel environments for improved performance."""
+    # Create environments in separate processes
+    env_fns = [make_env(city_name, budget, i) for i in range(n_envs)]
+    env = SubprocVecEnv(env_fns)
+    
+    # Print environment info
+    print(f"Training with {n_envs} parallel environments")
     
     model = PPO(
         "MlpPolicy", 
@@ -814,6 +841,9 @@ def train_rl_model(city_name='Amsterdam, Netherlands', budget=10000, total_times
         total_timesteps=total_timesteps,
         callback=[progress_callback, checkpoint_callback]
     )
+    
+    # Close environment processes when done
+    env.close()
     
     return model
 
@@ -882,16 +912,20 @@ def main():
     """Main function to demonstrate the bike path RL model."""
     import argparse
     import time
+
+    max_cpu_count = multiprocessing.cpu_count()
+    default_n_envs = max(1, max_cpu_count-1)
+    default_n_steps = 2048
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train and evaluate a RL model for bike path planning')
-    parser.add_argument('--city', type=str, default='Colmar, France', 
-                        help='City name to analyze (default: Amsterdam, Netherlands)')
-    parser.add_argument('--budget', type=float, default=10000, 
+    parser.add_argument('--city', type=str, default='Kuranda, Australia', 
+                        help='City name to analyze (default: Kuranda, Australia)')
+    parser.add_argument('--budget', type=float, default=100000, 
                         help='Budget for bike path construction (default: 10000)')
-    parser.add_argument('--timesteps', type=int, default=10000, 
-                        help='Training timesteps (default: 10000)')
-    parser.add_argument('--eval_episodes', type=int, default=3, 
+    parser.add_argument('--timesteps', type=int, default=10240, 
+                        help='Training timesteps (default: 10240)')
+    parser.add_argument('--eval_episodes', type=int, default=5, 
                         help='Number of evaluation episodes (default: 5)')
     parser.add_argument('--skip_training', action='store_true', 
                         help='Skip training and load existing model')
@@ -899,8 +933,16 @@ def main():
                         help='Path to existing model (for --skip_training)')
     parser.add_argument('--device', type=str, default='cpu', 
                         help='Training device (default: cpu)')
+    parser.add_argument('--n_envs', type=int, default=default_n_envs, 
+                        help='Number of environments (default: max-1 cpu count))')
     
     args = parser.parse_args()
+    
+    batch_size = default_n_steps * args.n_envs
+    num_updates = math.ceil(args.timesteps / batch_size)
+    adjusted_timesteps = num_updates * batch_size
+    
+    
     
     start_time = time.time()
 
@@ -909,7 +951,9 @@ def main():
     print("="*70)
     print(f"City: {args.city}")
     print(f"Budget: {args.budget}")
-    print(f"Training timesteps: {args.timesteps}")
+    print(f"Requested timesteps: {args.timesteps}")
+    print(f"Adjusted timesteps: {adjusted_timesteps}")
+    print(f"Using {args.n_envs} environments (of {max_cpu_count} available cores))")
     print(f"Evaluation episodes: {args.eval_episodes}")
     print("="*70 + "\n")
     
@@ -918,7 +962,7 @@ def main():
         print(f"Loading existing model from {args.model_path}...")
         model = PPO.load(args.model_path)
     else:
-        model = train_rl_model(city_name=args.city, budget=args.budget, total_timesteps=args.timesteps, device=args.device)
+        model = train_rl_model(city_name=args.city, budget=args.budget, total_timesteps=adjusted_timesteps, device=args.device, n_envs=args.n_envs)
     
     best_paths, best_state = evaluate_and_visualize(
         model, 
