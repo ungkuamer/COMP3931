@@ -19,6 +19,15 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
+'''
+Implementation using RustworkX instead of NetworkX to
+allow faster lengths and connectivity calculations.
+
+Further additions:
+1. Cleaner stdout/print statement - only shows progress of the steps
+2. Use SubprocVecEnv and multiple envs for parallel training - use max-1 core count
+3. Change sampling for connectivity calculation - faster calculation of large graph
+'''
 
 # Utility functions for NetworkX to rustworkx conversion
 def nx_to_rx(nx_graph, weight_attribute='length'):
@@ -102,10 +111,39 @@ class BikePathEnv(gym.Env):
     and route directness.
     """
     
-    def __init__(self, city_name, budget=1000, edge_cost_factor=10):
+    def __init__(self, city_name=None, bbox=None, budget=1000, edge_cost_factor=10):
         super(BikePathEnv, self).__init__()
         
-        print(f"Initializing environment for {city_name}")
+        if city_name is not None:
+            print(f"Initializing environment for {city_name}")
+            # Load the city graph using city name
+            self.original_graph = ox.graph_from_place(city_name, network_type='bike')
+            self.city_name = city_name
+            self.location_type = "city"
+            
+            # Create a working copy of the graph
+            self.graph = self.original_graph.copy()
+            
+            # Get all roads that don't already have bike infrastructure
+            self.walk_graph = ox.graph_from_place(city_name, network_type='walk')
+        
+        elif bbox is not None:
+            north, south, east, west = bbox
+            print(f"Initializing environment for bbox: {north}, {south}, {east}, {west}")
+            # Load the graph using bounding box coordinates
+            self.original_graph = ox.graph_from_bbox(north, south, east, west, network_type='bike')
+            self.bbox = bbox
+            self.city_name = f"Area_({north:.4f},{south:.4f},{east:.4f},{west:.4f})"
+            self.location_type = "bbox"
+            
+            # Create a working copy of the graph
+            self.graph = self.original_graph.copy()
+            
+            # Get all roads that don't already have bike infrastructure
+            self.walk_graph = ox.graph_from_bbox(north, south, east, west, network_type='walk')
+        
+        else:
+            raise ValueError("Either city_name or bbox must be provided")
         
         # Load the city graph - osmnx returns NetworkX graphs
         self.original_graph = ox.graph_from_place(city_name, network_type='bike')
@@ -272,39 +310,44 @@ class BikePathEnv(gym.Env):
             if clustering is None:
                 clustering = 0.0
                 
-            #print(f"Successfully calculated clustering: {clustering:.4f}")
-            
-            # Calculate average path length using rustworkx's built-in function
-            # Use a sampling approach for large graphs
-            if rx_subgraph.num_nodes() > 100:
-                sampled_nodes = random.sample(range(rx_subgraph.num_nodes()), 100)
-                node_pairs = list(itertools.combinations(sampled_nodes, 2))
+            # Calculate average path length with improved sampling and single-source calculations
+            path_lengths = []
+
+            # More aggressive sampling for large graphs
+            if rx_subgraph.num_nodes() > 1000:
+                # Logarithmic sampling for very large graphs
+                sample_size = max(10, int(math.log(rx_subgraph.num_nodes()) * 5))
+                sampled_nodes = random.sample(range(rx_subgraph.num_nodes()), sample_size)
+            elif rx_subgraph.num_nodes() > 100:
+                # Square root sampling for medium graphs
+                sample_size = max(10, int(math.sqrt(rx_subgraph.num_nodes())))
+                sampled_nodes = random.sample(range(rx_subgraph.num_nodes()), sample_size)
             else:
-                node_pairs = list(itertools.combinations(range(rx_subgraph.num_nodes()), 2))
-            
+                # Use all nodes for small graphs
+                sampled_nodes = list(range(rx_subgraph.num_nodes()))
+
             # Define weight function for rustworkx
             def weight_fn(edge_data):
                 return edge_data.get('length', 1.0)
-            
-            # Use rustworkx's all-pairs shortest path function
-            path_lengths = []
-            
-            # Calculate path lengths for each pair in the sample
-            for u, v in node_pairs:
+
+            # For each source node, calculate all paths at once
+            for source in sampled_nodes:
                 try:
-                    # Use dijkstra_shortest_path_lengths which returns a dictionary
-                    path_lengths_dict = rx.dijkstra_shortest_path_lengths(rx_subgraph, u, weight_fn, goal=v)
-                    if v in path_lengths_dict and path_lengths_dict[v] > 0:
-                        path_lengths.append(path_lengths_dict[v])
-                except (rx.NoPathFound, Exception) as e:
-                    print(f"Error calculating path length between {u} and {v}: {e}")
-                    exit()
+                    # Calculate distances to all nodes from this source in one call
+                    distances = rx.dijkstra_shortest_path_lengths(rx_subgraph, source, weight_fn)
+                    
+                    # Sample a few target nodes for each source
+                    targets = random.sample(sampled_nodes, min(5, len(sampled_nodes)))
+                    for target in targets:
+                        if target != source and target in distances and distances[target] > 0:
+                            path_lengths.append(distances[target])
+                except Exception as e:
+                    # Don't exit on error, just continue
+                    continue
             
             # Calculate metrics
             if path_lengths:
                 avg_path_length = np.mean(path_lengths)
-                #print(f"Successfully calculated {len(path_lengths)} path lengths")
-                #print(f"Average path length: {avg_path_length:.1f}m")
             else:
                 print("Warning: No valid path lengths calculated")
                 avg_path_length = float('inf')
@@ -315,8 +358,6 @@ class BikePathEnv(gym.Env):
                 normalized_path = 0.0
             else:
                 normalized_path = 1.0 / (1.0 + avg_path_length/1000)
-            
-            #print(f"Final metrics - clustering: {normalized_clustering:.4f}, path_efficiency: {normalized_path:.4f}")
             
             return normalized_clustering, normalized_path
             
@@ -468,7 +509,7 @@ class BikePathEnv(gym.Env):
         # Calculate reward with more weight on connectivity improvements
         state_improvement = [
             (new - old) * weight for new, old, weight in 
-            zip(self.state[:3], old_state[:3], [0.4, 0.3, 0.3])  # Weights for each metric
+            zip(self.state[:3], old_state[:3], [0.9, 0.2, 0.3])  # connectivity, efficiency, population
         ]
         reward = sum(state_improvement) * 100
         
@@ -595,7 +636,9 @@ class BikePathEnv(gym.Env):
                 f"Bike Network Plan - {self.city_name}\n"
                 f"Connectivity: {conn:.3f} | Path Efficiency: {path_eff:.3f} | "
                 f"Population Served: {pop:.3f}\n"
-                f"Budget: {self.budget:.0f}/{self.initial_budget:.0f} "
+                f"Total Timesteps: {self.total_steps}\n"
+                f"Episode: {self.episode_count}"
+                f"Budget Remaining: {self.budget:.0f}/{self.initial_budget:.0f} "
                 f"({(1-budget_remain)*100:.1f}% used)"
             )
             
@@ -794,20 +837,20 @@ class EvaluationTracker:
         if self.pbar:
             self.pbar.close()
 
-def make_env(city_name, budget, rank):
+def make_env(city_name=None, bbox=None, budget=100000, rank=0):
     """
     Function that creates an environment with a specific seed for process isolation
     """
     def _init():
-        env = BikePathEnv(city_name=city_name, budget=budget)
+        env = BikePathEnv(city_name=city_name, bbox=bbox, budget=budget)
         env.reset(seed=rank)  # Different seed for each environment
         return env
     return _init
 
-def train_rl_model(city_name, budget, total_timesteps, device, n_envs):
+def train_rl_model(city_name=None, bbox=None, budget=100000, total_timesteps=10240, device="cpu", n_envs=2):
     """Train RL model with parallel environments for improved performance."""
     # Create environments in separate processes
-    env_fns = [make_env(city_name, budget, i) for i in range(n_envs)]
+    env_fns = [make_env(city_name=city_name, bbox=bbox, budget=budget, rank=i) for i in range(n_envs)]
     env = SubprocVecEnv(env_fns)
     
     # Print environment info
@@ -848,7 +891,7 @@ def train_rl_model(city_name, budget, total_timesteps, device, n_envs):
     return model
 
 
-def evaluate_and_visualize(model, city_name=None, budget=10000, num_evaluations=5):
+def evaluate_and_visualize(model, city_name=None, bbox=None, budget=10000, num_evaluations=5):
     """Evaluate model with improved progress tracking."""
     # Initialize evaluation tracker
     tracker = EvaluationTracker(num_evaluations)
@@ -857,7 +900,7 @@ def evaluate_and_visualize(model, city_name=None, budget=10000, num_evaluations=
     try:
         for _ in range(num_evaluations):
             # Create fresh environment
-            env = BikePathEnv(city_name=city_name, budget=budget)
+            env = BikePathEnv(city_name=city_name, bbox=bbox, budget=budget)
             obs, _ = env.reset()
             done = False
             truncated = False
@@ -919,8 +962,11 @@ def main():
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train and evaluate a RL model for bike path planning')
-    parser.add_argument('--city', type=str, default='Kuranda, Australia', 
-                        help='City name to analyze (default: Kuranda, Australia)')
+    location_group = parser.add_mutually_exclusive_group(required=True)
+    location_group.add_argument('--city', type=str, 
+                        help='City name to analyze')
+    location_group.add_argument('--bbox', type=float, nargs=4, metavar=('NORTH', 'SOUTH', 'EAST', 'WEST'),
+                        help='Bounding box coordinates (north, south, east, west)')
     parser.add_argument('--budget', type=float, default=100000, 
                         help='Budget for bike path construction (default: 10000)')
     parser.add_argument('--timesteps', type=int, default=10240, 
@@ -937,7 +983,7 @@ def main():
                         help='Number of environments (default: max-1 cpu count))')
     
     args = parser.parse_args()
-    
+
     batch_size = default_n_steps * args.n_envs
     num_updates = math.ceil(args.timesteps / batch_size)
     adjusted_timesteps = num_updates * batch_size
@@ -951,6 +997,7 @@ def main():
     print("="*70)
     print(f"City: {args.city}")
     print(f"Budget: {args.budget}")
+    print(f"Bbox: {args.bbox}")
     print(f"Requested timesteps: {args.timesteps}")
     print(f"Adjusted timesteps: {adjusted_timesteps}")
     print(f"Using {args.n_envs} environments (of {max_cpu_count} available cores))")
@@ -962,11 +1009,12 @@ def main():
         print(f"Loading existing model from {args.model_path}...")
         model = PPO.load(args.model_path)
     else:
-        model = train_rl_model(city_name=args.city, budget=args.budget, total_timesteps=adjusted_timesteps, device=args.device, n_envs=args.n_envs)
+        model = train_rl_model(city_name=args.city, bbox=args.bbox, budget=args.budget, total_timesteps=adjusted_timesteps, device=args.device, n_envs=args.n_envs)
     
     best_paths, best_state = evaluate_and_visualize(
         model, 
         city_name=args.city, 
+        bbox=args.bbox, 
         budget=args.budget,
         num_evaluations=args.eval_episodes
     )
