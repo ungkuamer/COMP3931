@@ -1,0 +1,12 @@
+BIKE PATH REINFORCEMENT LEARNING RUN SUMMARY
+=======================================
+Run ID: run_20250318_000000
+Date: 2025-03-18 00:04:40
+City: Kota Bharu, Kelantan
+Bbox: None
+Budget: 100000
+Timesteps: 4096
+Environments: 2
+Evaluation episodes: 5
+Total runtime: 0h 4m 39.43s
+=======================================

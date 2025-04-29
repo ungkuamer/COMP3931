@@ -12,6 +12,8 @@ import time
 import os
 import math
 import itertools
+import scipy
+import pickle
 import multiprocessing
 from datetime import datetime, timedelta
 from tqdm import tqdm
@@ -19,6 +21,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
+from learning_analyzer import analyze_learning_curve, find_latest_rewards_data
 '''
 Implementation using RustworkX instead of NetworkX to
 allow faster lengths and connectivity calculations.
@@ -27,7 +30,42 @@ Further additions:
 1. Cleaner stdout/print statement - only shows progress of the steps
 2. Use SubprocVecEnv and multiple envs for parallel training - use max-1 core count
 3. Change sampling for connectivity calculation - faster calculation of large graph
+4. Group all figures by run in the same subdirectory
 '''
+
+# Create a global variable to store the run ID and figures directory
+RUN_ID = None
+RUN_FIGURES_DIR = None
+
+def generate_run_id():
+    """Generate a unique run ID based on timestamp"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"run_{timestamp}"
+
+def setup_run_directory(city_name=None):
+    """Setup the run-specific directory for all figure outputs"""
+    global RUN_ID, RUN_FIGURES_DIR
+    
+    # Generate a unique run ID
+    RUN_ID = generate_run_id()
+    
+    # Create a base directory for all figure outputs
+    base_dir = "./bike_path_figures"
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # Create a descriptive name for the run directory
+    if city_name:
+        safe_city_name = city_name.replace(', ', '_').replace(' ', '_')
+        run_dir_name = f"{safe_city_name}_{RUN_ID}"
+    else:
+        run_dir_name = RUN_ID
+    
+    # Create the full path to the run directory
+    RUN_FIGURES_DIR = os.path.join(base_dir, run_dir_name)
+    os.makedirs(RUN_FIGURES_DIR, exist_ok=True)
+    
+    print(f"All figures for this run will be saved to: {RUN_FIGURES_DIR}")
+    return RUN_FIGURES_DIR
 
 # Utility functions for NetworkX to rustworkx conversion
 def nx_to_rx(nx_graph, weight_attribute='length'):
@@ -192,6 +230,15 @@ class BikePathEnv(gym.Env):
         self.total_steps = 0
         self.episode_rewards = []
         self.episode_lengths = []
+
+        # Set update frequency based on graph size
+        graph_size = len(self.walk_graph.edges())
+        if graph_size > 5000:
+            self.update_frequency = 5  # Only update every 5 steps for very large graphs
+        elif graph_size > 1000:
+            self.update_frequency = 3  # Update every 3 steps for large graphs
+        else:
+            self.update_frequency = 1  # Update every step for small graphs (current behavior)
         
         # Print initial state
         #print("Initial state:", self.state)
@@ -251,7 +298,7 @@ class BikePathEnv(gym.Env):
                         'tertiary': 3,     # Connecting local roads
                         'residential': 2,  # Residential streets
                         'unclassified': 1, # Minor roads
-                        'living_street': 1 # Very low traffic residential
+                        #'living_street': 1 # Very low traffic residential
                     }
                     
                     suitable_types = set(road_priorities.keys())
@@ -267,7 +314,7 @@ class BikePathEnv(gym.Env):
                                 data['length'] = ox.distance.great_circle(u_coords, v_coords)
                             
                             # Additional validation
-                            if data['length'] > 0 and data['length'] < 500:  # Max 500m segments
+                            if data['length'] > 100 and data['length'] < 1000:
                                 # Add road priority to data
                                 data['road_priority'] = road_priorities.get(road_type, 0)
                                 
@@ -344,13 +391,20 @@ class BikePathEnv(gym.Env):
             return 1.0  # Maximum fragmentation on error
         
     def _calculate_connectivity(self):
-        """Calculate connectivity metrics using rustworkx's built-in parallel functionality."""
+        """Calculate connectivity metrics using rustworkx's built-in parallel functionality with optimization."""
         try:
             # Verify graph has nodes and edges
             if len(self.graph.nodes()) == 0 or len(self.graph.edges()) == 0:
                 print("Warning: Graph has no nodes or edges")
                 return 0.0, 0.0
-                
+            
+            current_edge_count = len(self.graph.edges())
+            if hasattr(self, '_last_connectivity_edges') and \
+            self._last_connectivity_edges == current_edge_count and \
+            hasattr(self, '_cached_connectivity') and \
+            hasattr(self, '_cached_path_efficiency'):
+                return self._cached_connectivity, self._cached_path_efficiency
+                    
             # Convert multigraph to simple graph
             import networkx as nx  # Import here for compatibility
             simple_graph = nx.Graph()
@@ -376,40 +430,85 @@ class BikePathEnv(gym.Env):
             # Create subgraph of largest component
             rx_subgraph = rx_simple_graph.subgraph(list(largest_cc), preserve_attrs=True)
             
-            # Calculate average clustering coefficient using rustworkx's built-in function
-            # rx.transitivity calculates the global clustering coefficient
-            clustering = rx.transitivity(rx_subgraph)
-            if clustering is None:
-                clustering = 0.0
+            # OPTIMIZATION 3: Approximated clustering coefficient for large graphs
+            graph_size = rx_subgraph.num_nodes()
+            if graph_size > 10000:
+                # Use sampling approach for extremely large graphs
+                clustering_sample_size = min(40, graph_size)  # Reduced from 100
+                sampled_nodes = random.sample(range(graph_size), clustering_sample_size)
                 
-            # Calculate average path length with improved sampling and single-source calculations
+                clustering_values = []
+                for node in sampled_nodes:
+                    try:
+                        # Calculate local clustering coefficient for sample nodes
+                        local_clustering = rx.local_clustering_coefficient(rx_subgraph, node)
+                        if local_clustering is not None:
+                            clustering_values.append(local_clustering)
+                    except:
+                        continue
+                
+                # Average the sampled values
+                clustering = np.mean(clustering_values) if clustering_values else 0.0
+            elif graph_size > 5000:
+                # Use sampling approach for very large graphs
+                clustering_sample_size = min(60, graph_size)  # Reduced from 100
+                sampled_nodes = random.sample(range(graph_size), clustering_sample_size)
+                
+                clustering_values = []
+                for node in sampled_nodes:
+                    try:
+                        # Calculate local clustering coefficient for sample nodes
+                        local_clustering = rx.local_clustering_coefficient(rx_subgraph, node)
+                        if local_clustering is not None:
+                            clustering_values.append(local_clustering)
+                    except:
+                        continue
+                
+                # Average the sampled values
+                clustering = np.mean(clustering_values) if clustering_values else 0.0
+            else:
+                # Use global transitivity for smaller graphs (original code)
+                clustering = rx.transitivity(rx_subgraph)
+                if clustering is None:
+                    clustering = 0.0
+                
+            # OPTIMIZATION 2: Calculate average path length with MUCH MORE aggressive sampling
             path_lengths = []
 
-            # More aggressive sampling for large graphs
-            if rx_subgraph.num_nodes() > 1000:
-                # Logarithmic sampling for very large graphs
-                sample_size = max(10, int(math.log(rx_subgraph.num_nodes()) * 5))
-                sampled_nodes = random.sample(range(rx_subgraph.num_nodes()), sample_size)
-            elif rx_subgraph.num_nodes() > 100:
+            # Much more aggressive sampling strategy for large graphs
+            if graph_size > 10000:
+                # Extremely aggressive sampling for extremely large graphs
+                sample_size = max(1, int(math.log(graph_size)))
+                sampled_nodes = random.sample(range(graph_size), min(sample_size, graph_size))
+            elif graph_size > 5000:
+                # Very aggressive sampling for very large graphs
+                sample_size = max(2, int(math.log(graph_size) * 1.2))
+                sampled_nodes = random.sample(range(graph_size), min(sample_size, graph_size))
+            elif graph_size > 1000:
+                # More aggressive sampling for large graphs
+                sample_size = max(3, int(math.log(graph_size) * 1.5))
+                sampled_nodes = random.sample(range(graph_size), min(sample_size, graph_size))
+            elif graph_size > 100:
                 # Square root sampling for medium graphs
-                sample_size = max(10, int(math.sqrt(rx_subgraph.num_nodes())))
-                sampled_nodes = random.sample(range(rx_subgraph.num_nodes()), sample_size)
+                sample_size = max(8, int(math.sqrt(graph_size)))
+                sampled_nodes = random.sample(range(graph_size), min(sample_size, graph_size))
             else:
                 # Use all nodes for small graphs
-                sampled_nodes = list(range(rx_subgraph.num_nodes()))
+                sampled_nodes = list(range(graph_size))
 
             # Define weight function for rustworkx
             def weight_fn(edge_data):
                 return edge_data.get('length', 1.0)
 
-            # For each source node, calculate all paths at once
+            # Limit target nodes for each source to reduce calculations
             for source in sampled_nodes:
                 try:
                     # Calculate distances to all nodes from this source in one call
                     distances = rx.dijkstra_shortest_path_lengths(rx_subgraph, source, weight_fn)
                     
-                    # Sample a few target nodes for each source
-                    targets = random.sample(sampled_nodes, min(5, len(sampled_nodes)))
+                    # Limit target nodes based on graph size
+                    target_count = 2 if graph_size > 5000 else 3
+                    targets = random.sample(sampled_nodes, min(target_count, len(sampled_nodes)))
                     for target in targets:
                         if target != source and target in distances and distances[target] > 0:
                             path_lengths.append(distances[target])
@@ -431,12 +530,73 @@ class BikePathEnv(gym.Env):
             else:
                 normalized_path = 1.0 / (1.0 + avg_path_length/1000)
             
+            self._cached_connectivity = normalized_clustering
+            self._cached_path_efficiency = normalized_path
+            self._last_connectivity_edges = current_edge_count
+
             return normalized_clustering, normalized_path
-            
+                
         except Exception as e:
             print(f"Connectivity calculation failed: {e}")
             return 0.0, 0.0
     
+    def _update_path_efficiency_incremental(self, u, v):
+        """Incrementally update path efficiency when a new edge connects to the network."""
+        # Get current path efficiency
+        current_efficiency = self.state[1]
+        
+        # Define weight function for rustworkx
+        def weight_fn(edge_data):
+            return edge_data.get('length', 1.0)
+        
+        # Convert node IDs to rustworkx indices
+        if u in self.rx_node_map and v in self.rx_node_map:
+            u_rx = self.rx_node_map[u]
+            v_rx = self.rx_node_map[v]
+            
+            # Calculate a sample of new paths made possible by this edge
+            path_improvements = []
+            
+            # Sample at most 5 nodes from each side of the new edge
+            u_neighbors = list(self.rx_graph.neighbors(u_rx))[:5]
+            v_neighbors = list(self.rx_graph.neighbors(v_rx))[:5]
+            
+            for src in u_neighbors:
+                for dst in v_neighbors:
+                    if src != dst:
+                        try:
+                            # Check if a shorter path is now possible
+                            old_dist = rx.dijkstra_shortest_path_length(
+                                self.rx_graph, src, dst, weight_fn)
+                            
+                            # Approximate new distance through the new edge
+                            u_to_src_dist = rx.dijkstra_shortest_path_length(
+                                self.rx_graph, u_rx, src, weight_fn)
+                            v_to_dst_dist = rx.dijkstra_shortest_path_length(
+                                self.rx_graph, v_rx, dst, weight_fn)
+                            
+                            # Get edge weight between u and v
+                            edge_weight = weight_fn(self.rx_graph.get_edge_data(u_rx, v_rx))
+                            
+                            new_dist = u_to_src_dist + edge_weight + v_to_dst_dist
+                            
+                            if new_dist < old_dist:
+                                # Path improved, calculate the improvement factor
+                                improvement = (old_dist - new_dist) / old_dist
+                                path_improvements.append(improvement)
+                        except:
+                            continue
+            
+            # If we found improvements, update path efficiency
+            if path_improvements:
+                avg_improvement = sum(path_improvements) / len(path_improvements)
+                # Apply a weighted update to current efficiency
+                # Use a small factor (0.1) to avoid overestimating the impact
+                updated_efficiency = current_efficiency * (1 + 0.1 * avg_improvement)
+                return min(1.0, updated_efficiency)
+        
+        # If we can't calculate incremental update, return current value
+        return current_efficiency
 
     def _calculate_population_served(self):
         """Calculate population served with improved metrics using rustworkx."""
@@ -508,9 +668,8 @@ class BikePathEnv(gym.Env):
             return np.zeros(4, dtype=np.float32)
         
     
-    
     def step(self, action):
-        """Take an action with improved anti-fragmentation measures."""
+        """Take an action with improved anti-fragmentation measures and incremental updates."""
         self.episode_steps += 1
         self.total_steps += 1
         
@@ -520,6 +679,10 @@ class BikePathEnv(gym.Env):
         
         # Get selected edge
         u, v, data = self.candidate_edges[action]
+        
+        # Store old state before modification
+        old_state = self.state.copy()
+        old_fragmentation = getattr(self, 'current_fragmentation', 1.0)
         
         # Validate edge cost
         cost = data.get('length', 0) * self.edge_cost_factor
@@ -581,11 +744,22 @@ class BikePathEnv(gym.Env):
             
             self.added_paths.append((u, v, edge_data['length']))
         
-        # Calculate new state and reward
-        old_state = self.state
-        old_fragmentation = getattr(self, 'current_fragmentation', 1.0)
-        self.state = self._get_state()
-        new_fragmentation = self.current_fragmentation
+        # OPTIMIZATION 1: Use incremental state updates instead of full recalculation
+        if connects_to_bike_path:
+            # Edge connects to existing network - update path efficiency incrementally
+            path_efficiency = self._update_path_efficiency_incremental(u, v)
+            self.state[1] = path_efficiency
+            
+            # Update normalized budget directly
+            self.state[3] = self.budget / self.initial_budget
+            
+            # We still need to update fragmentation score for proper rewards
+            old_fragmentation = self.current_fragmentation
+            self.current_fragmentation = self._calculate_fragmentation()
+        else:
+            # Edge creates a new component - need full state recalculation
+            old_state = self.state
+            self.state = self._get_state()
         
         # Calculate reward with more weight on connectivity improvements
         state_improvement = [
@@ -606,7 +780,7 @@ class BikePathEnv(gym.Env):
             reward += continuity_bonus
         
         # Add fragmentation improvement bonus (or penalty)
-        fragmentation_improvement = old_fragmentation - new_fragmentation
+        fragmentation_improvement = old_fragmentation - self.current_fragmentation
         fragmentation_reward = fragmentation_improvement * 200  # High weight for reducing fragmentation
         reward += fragmentation_reward
         
@@ -654,7 +828,7 @@ class BikePathEnv(gym.Env):
             "connectivity": self.state[0],
             "path_efficiency": self.state[1],
             "population_served": self.state[2],
-            "fragmentation": new_fragmentation,
+            "fragmentation": self.current_fragmentation,
             "action_index": action,
             "edge_cost": cost,
             "edge_length": data['length'],
@@ -763,23 +937,25 @@ class BikePathEnv(gym.Env):
             plt.title(title)
             
             # Save figure with timesteps and evaluation number in the filename
-            os.makedirs("./bike_path_figures", exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Build filename with evaluation number if provided
-            filename = f"{self.city_name.replace(', ', '_')}_step{self.total_steps}"
+            # Use the run-specific directory if available
+            if RUN_FIGURES_DIR is not None:
+                save_dir = RUN_FIGURES_DIR
+            else:
+                save_dir = "./bike_path_figures"
+                os.makedirs(save_dir, exist_ok=True)
+                
+            # Build filename
+            filename = f"{self.city_name.replace(', ', '_').replace(' ', '_')}_step{self.total_steps}"
             if eval_num is not None:
                 filename += f"_eval{eval_num}"
-            filename += f"_{timestamp}.png"
+            filename += ".png"
             
-            fig_path = f"./bike_path_figures/{filename}"
+            fig_path = os.path.join(save_dir, filename)
             plt.savefig(fig_path, dpi=300, bbox_inches='tight')
             print(f"Saved figure to {fig_path}")
             
-            if mode == 'human':
-                plt.show()
-            else:
-                return fig
+            plt.show()
+            return fig
                 
         except Exception as e:
             print(f"Error in render: {e}")
@@ -828,7 +1004,7 @@ class BikePathEnv(gym.Env):
 class TrainingProgressCallback(BaseCallback):
     """
     Progress callback showing a progress bar during training,
-    accounting for multiple parallel environments.
+    accounting for multiple parallel environments, and tracking rewards over time.
     """
     def __init__(self, total_timesteps):
         super(TrainingProgressCallback, self).__init__(verbose=0)
@@ -836,6 +1012,7 @@ class TrainingProgressCallback(BaseCallback):
         self.pbar = None
         self.training_start = None
         self.episode_rewards = []
+        self.episode_timesteps = []  # Store timesteps for each episode reward
         self.last_timesteps = 0
         
     def _on_training_start(self):
@@ -855,19 +1032,26 @@ class TrainingProgressCallback(BaseCallback):
             self.pbar.update(steps_done)
             
             # Update reward description if available
-            if len(self.locals["infos"]) > 0 and "episode" in self.locals["infos"][0]:
-                reward = self.locals["infos"][0]["episode"]["r"]
-                self.episode_rewards.append(reward)
-                avg_reward = np.mean(self.episode_rewards[-100:])
-                self.pbar.set_description(
-                    f"Training ({n_envs} envs) | Avg reward: {avg_reward:.2f}"
-                )
+            if len(self.locals["infos"]) > 0:
+                for info in self.locals["infos"]:
+                    if "episode" in info:
+                        reward = info["episode"]["r"]
+                        self.episode_rewards.append(reward)
+                        self.episode_timesteps.append(self.num_timesteps)  # Store current timestep
+                        avg_reward = np.mean(self.episode_rewards[-100:])
+                        self.pbar.set_description(
+                            f"Training ({n_envs} envs) | Avg reward: {avg_reward:.2f}"
+                        )
         
         return True
     
     def _on_training_end(self):
         if self.pbar:
             self.pbar.close()
+            
+    def get_reward_data(self):
+        """Return the reward and timestep data for plotting."""
+        return self.episode_timesteps, self.episode_rewards
 
 class EvaluationTracker:
     """
@@ -974,7 +1158,7 @@ def make_env(city_name=None, bbox=None, budget=100000, rank=0):
         return env
     return _init
 
-def train_rl_model(city_name=None, bbox=None, budget=100000, total_timesteps=10240, device="cpu", n_envs=2):
+def train_rl_model(city_name=None, bbox=None, budget=100000, total_timesteps=10240, device="cpu", n_envs=2, plot_rewards=True):
     """Train RL model with parallel environments for improved performance."""
     # Create environments in separate processes
     env_fns = [make_env(city_name=city_name, bbox=bbox, budget=budget, rank=i) for i in range(n_envs)]
@@ -999,9 +1183,14 @@ def train_rl_model(city_name=None, bbox=None, budget=100000, total_timesteps=102
     
     # Setup callbacks
     progress_callback = TrainingProgressCallback(total_timesteps)
+    
+    # Create checkpoint directory within the run directory
+    checkpoint_dir = os.path.join(RUN_FIGURES_DIR, "checkpoints") if RUN_FIGURES_DIR else "./checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     checkpoint_callback = CheckpointCallback(
         save_freq=max(total_timesteps // 10, 1000),
-        save_path="./checkpoints/",
+        save_path=checkpoint_dir,
         name_prefix="bike_model",
         verbose=0
     )
@@ -1011,6 +1200,17 @@ def train_rl_model(city_name=None, bbox=None, budget=100000, total_timesteps=102
         total_timesteps=total_timesteps,
         callback=[progress_callback, checkpoint_callback]
     )
+    
+    # Plot reward history using the run directory if available
+    if plot_rewards:
+        timesteps, rewards = progress_callback.get_reward_data()
+        plot_reward_vs_timestep(
+            rewards=rewards, 
+            timesteps=timesteps, 
+            city_name=city_name,
+            smoothing=10,
+            save_path=os.path.join(RUN_FIGURES_DIR, "training_rewards.png") if RUN_FIGURES_DIR else None
+        )
     
     # Close environment processes when done
     env.close()
@@ -1069,22 +1269,209 @@ def evaluate_and_visualize(model, city_name=None, bbox=None, budget=10000, num_e
         best_eval_num = tracker.best_solution.get('eval_num', None)
         best_env.render(mode='human', eval_num=best_eval_num)
         
+        '''
         # Export results if available
         try:
             gdf = best_env.get_edge_gdf()
             if gdf is not None:
                 safe_name = city_name.replace(', ', '_').replace(' ', '_')
                 eval_tag = f"_eval{best_eval_num}" if best_eval_num else ""
-                gdf.to_file(f"suggested_bike_paths_{safe_name}{eval_tag}.geojson", driver='GeoJSON')
+                
+                # Use run directory if available
+                if RUN_FIGURES_DIR:
+                    export_path = os.path.join(RUN_FIGURES_DIR, f"suggested_bike_paths{eval_tag}.geojson")
+                else:
+                    export_path = f"suggested_bike_paths_{safe_name}{eval_tag}.geojson"
+                
+                gdf.to_file(export_path, driver='GeoJSON')
         except Exception as e:
             print(f"Error exporting results: {e}")
+        '''
+        
+    # Plot evaluation results
+    plot_evaluation_results(tracker, city_name)
     
     return tracker.best_solution['paths'], tracker.best_solution['env'].state if tracker.best_solution else (None, None)
 
+def plot_reward_vs_timestep(rewards, timesteps=None, city_name=None, smoothing=5, 
+                           save_path=None, show=True):
+    """
+    Plot reward vs timestep or episode from training or evaluation.
+    
+    Parameters:
+    -----------
+    rewards : list
+        List of episode rewards.
+    timesteps : list, optional
+        List of timesteps for each episode. If None, will use episode numbers.
+    city_name : str, optional
+        City name for the figure title.
+    smoothing : int, optional
+        Smoothing window size. Set to 0 for no smoothing.
+    save_path : str, optional
+        If provided, save the figure to this path.
+    show : bool, optional
+        Whether to display the plot. Default is True.
+    
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The generated figure.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    from datetime import datetime
+    
+    if not rewards:
+        print("No reward data available for plotting.")
+        return None
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Determine x-axis: timesteps or episode numbers
+    if timesteps and len(timesteps) == len(rewards):
+        x_values = timesteps
+        x_label = "Timesteps"
+    else:
+        x_values = np.arange(1, len(rewards) + 1)
+        x_label = "Episode"
+    
+    # Plot raw rewards
+    ax.scatter(x_values, rewards, alpha=0.4, color='blue', label='Rewards')
+    
+    # Add smoothed curve if requested
+    if smoothing > 0 and len(rewards) > smoothing * 2:
+        try:
+            # Try to use scipy for better smoothing if available
+            from scipy.ndimage import gaussian_filter1d
+            y_smooth = gaussian_filter1d(rewards, sigma=smoothing)
+            ax.plot(x_values, y_smooth, linewidth=2, color='red', 
+                    label=f'Smoothed (σ={smoothing})')
+        except ImportError:
+            # Fall back to moving average if scipy not available
+            window_size = min(len(rewards), max(3, smoothing * 2))
+            smoothed = []
+            for i in range(len(rewards)):
+                start = max(0, i - window_size // 2)
+                end = min(len(rewards), i + window_size // 2 + 1)
+                window = rewards[start:end]
+                smoothed.append(sum(window) / len(window))
+            ax.plot(x_values, smoothed, linewidth=2, color='red', 
+                    label=f'Moving Avg (window={window_size})')
+    
+    # Add mean line
+    mean_reward = np.mean(rewards)
+    ax.axhline(y=mean_reward, color='green', linestyle='--', 
+               label=f'Mean: {mean_reward:.2f}')
+    
+    # Set labels and title
+    title = 'Reward History'
+    if city_name:
+        title += f' - {city_name}'
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel('Reward')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    plt.tight_layout()
+    
+    # Save if path is provided
+    if save_path:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+   
+    return fig
+
+def plot_evaluation_results(evaluation_tracker, city_name=None):
+    """
+    Plot comprehensive evaluation results from an EvaluationTracker instance.
+    
+    Parameters:
+    -----------
+    evaluation_tracker : EvaluationTracker
+        The evaluation tracker with result metrics
+    city_name : str, optional
+        City name for plot titles
+    
+    Returns:
+    --------
+    None
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    from datetime import datetime
+    
+    if not hasattr(evaluation_tracker, 'rewards') or not evaluation_tracker.rewards:
+        print("No evaluation data available for plotting.")
+        return
+    
+    # Determine save directory - use run directory if available
+    if RUN_FIGURES_DIR:
+        save_dir = RUN_FIGURES_DIR
+    else:
+        save_dir = "./bike_path_figures"
+        os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. Plot rewards from evaluation episodes
+    plot_reward_vs_timestep(
+        rewards=evaluation_tracker.rewards,
+        city_name=f"{city_name} (Evaluation)" if city_name else "Evaluation",
+        smoothing=0,  # No smoothing for evaluation as we typically have fewer episodes
+        save_path=os.path.join(save_dir, "evaluation_rewards.png"),
+        show=False  # Don't show yet, we'll create a more comprehensive plot
+    )
+    
+    # 2. Create comprehensive metrics plot
+    metrics = {
+        'Reward': evaluation_tracker.rewards,
+        'Number of Paths': evaluation_tracker.num_paths,
+        'Connectivity': evaluation_tracker.connectivity,
+        'Path Efficiency': evaluation_tracker.path_efficiency,
+        'Population Coverage': evaluation_tracker.population,
+        'Budget Used (%)': [b * 100 for b in evaluation_tracker.budget_used]
+    }
+    
+    # Create subplots for each metric
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(12, 3*len(metrics)), sharex=True)
+    episodes = np.arange(1, len(evaluation_tracker.rewards) + 1)
+    
+    for i, (metric_name, values) in enumerate(metrics.items()):
+        ax = axes[i]
+        ax.plot(episodes, values, marker='o', linestyle='-', markersize=6)
+        ax.set_ylabel(metric_name)
+        ax.grid(True, alpha=0.3)
+        
+        # Add mean line
+        mean_val = np.mean(values)
+        ax.axhline(y=mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.2f}')
+        ax.legend()
+    
+    # Set common x label
+    axes[-1].set_xlabel("Evaluation Episode")
+    
+    # Add title
+    title = "Evaluation Metrics"
+    if city_name:
+        title += f" - {city_name}"
+    fig.suptitle(title)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    save_path = os.path.join(save_dir, "evaluation_metrics.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Evaluation metrics plot saved to: {save_path}")
+
 def main():
-    """Main function to demonstrate the bike path RL model."""
+    """Main function to demonstrate the bike path RL model with reward plotting."""
     import argparse
     import time
+    import multiprocessing
 
     max_cpu_count = multiprocessing.cpu_count()
     default_n_envs = max(1, max_cpu_count-1)
@@ -1111,14 +1498,14 @@ def main():
                         help='Training device (default: cpu)')
     parser.add_argument('--n_envs', type=int, default=default_n_envs, 
                         help='Number of environments (default: max-1 cpu count))')
+    parser.add_argument('--no_plots', action='store_true',
+                        help='Disable reward plotting')
     
     args = parser.parse_args()
 
     batch_size = default_n_steps * args.n_envs
     num_updates = math.ceil(args.timesteps / batch_size)
     adjusted_timesteps = num_updates * batch_size
-    
-    
     
     start_time = time.time()
 
@@ -1134,12 +1521,30 @@ def main():
     print(f"Evaluation episodes: {args.eval_episodes}")
     print("="*70 + "\n")
     
+    # Setup run directory for organizing outputs
+    city_name = args.city if args.city else f"BBox_{args.bbox}" if args.bbox else "Unknown"
+    setup_run_directory(city_name)
+    
     if args.skip_training and args.model_path:
         from stable_baselines3 import PPO
         print(f"Loading existing model from {args.model_path}...")
         model = PPO.load(args.model_path)
     else:
-        model = train_rl_model(city_name=args.city, bbox=args.bbox, budget=args.budget, total_timesteps=adjusted_timesteps, device=args.device, n_envs=args.n_envs)
+        model = train_rl_model(
+            city_name=args.city, 
+            bbox=args.bbox, 
+            budget=args.budget, 
+            total_timesteps=adjusted_timesteps, 
+            device=args.device, 
+            n_envs=args.n_envs,
+            plot_rewards=not args.no_plots
+        )
+        
+        # Save the final model to the run directory
+        if RUN_FIGURES_DIR:
+            model_path = os.path.join(RUN_FIGURES_DIR, "final_model.zip")
+            model.save(model_path)
+            print(f"Final model saved to {model_path}")
     
     best_paths, best_state = evaluate_and_visualize(
         model, 
@@ -1153,6 +1558,24 @@ def main():
     hours, remainder = divmod(total_time, 3600)
     minutes, seconds = divmod(remainder, 60)
     print(f"\nTotal runtime: {int(hours)}h {int(minutes)}m {seconds:.2f}s")
+    
+    # Save a summary file with run information
+    if RUN_FIGURES_DIR:
+        summary_path = os.path.join(RUN_FIGURES_DIR, "run_summary.txt")
+        with open(summary_path, 'w') as f:
+            f.write(f"BIKE PATH REINFORCEMENT LEARNING RUN SUMMARY\n")
+            f.write(f"=======================================\n")
+            f.write(f"Run ID: {RUN_ID}\n")
+            f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"City: {args.city}\n")
+            f.write(f"Bbox: {args.bbox}\n")
+            f.write(f"Budget: {args.budget}\n")
+            f.write(f"Timesteps: {adjusted_timesteps}\n")
+            f.write(f"Environments: {args.n_envs}\n")
+            f.write(f"Evaluation episodes: {args.eval_episodes}\n")
+            f.write(f"Total runtime: {int(hours)}h {int(minutes)}m {seconds:.2f}s\n")
+            f.write(f"=======================================\n")
+        print(f"Run summary saved to {summary_path}")
     
     return best_paths, best_state
 

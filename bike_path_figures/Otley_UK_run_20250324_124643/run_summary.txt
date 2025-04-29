@@ -1,0 +1,12 @@
+BIKE PATH REINFORCEMENT LEARNING RUN SUMMARY
+=======================================
+Run ID: run_20250324_124643
+Date: 2025-03-24 12:49:00
+City: Otley, UK
+Bbox: None
+Budget: 300000.0
+Timesteps: 14336
+Environments: 7
+Evaluation episodes: 5
+Total runtime: 0h 2m 17.19s
+=======================================
